@@ -1,4 +1,5 @@
-# MarketHound — Market Reaper
+# MarketHound — Market Reaper<img width="525" height="78" alt="image" src="https://github.com/user-attachments/assets/bcbdbeec-2c24-43eb-8d3e-a7df966a7768" />
+
 
 > **Evidence Driven. Precision Executed.**
 
