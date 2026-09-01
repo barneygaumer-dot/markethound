@@ -1,0 +1,206 @@
+<!doctype html><html><head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>MarketHound {{ version }}</title><script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
+<style>
+:root{--bg:#0b1016;--panel:#111821;--panel2:#0d141b;--line:#2a3948;--text:#eef4f8;--muted:#8e9aa8;--green:#43d17d;--red:#ff5d5d;--orange:#f59b3d;--blue:#35aef2;--pink:#ee5f84}
+*{box-sizing:border-box}html,body{width:100%;height:100%;margin:0}body{font-family:system-ui,-apple-system,sans-serif;background:var(--bg);color:var(--text);overflow:hidden}.wrap{width:100%;height:100vh;height:100dvh;padding:8px 10px;display:flex;flex-direction:column;gap:6px;min-height:0}h1{font-size:24px;margin:0;line-height:1.12}.brandbar{display:flex;justify-content:space-between;align-items:center;gap:14px;min-height:0;flex:0 0 auto}.brandmeta{display:flex;gap:15px;align-items:center;color:#c3ccd5;font-size:12px;white-space:nowrap}.tabs{display:flex;gap:6px}.tabbtn.active{border-color:#7591ae;background:#182432}.panel{display:none;min-height:0}.panel.active{display:flex;flex:1 1 auto;min-height:0;overflow:hidden}.mission-shell{display:flex;flex:1 1 auto;flex-direction:column;gap:6px;min-height:0;width:100%;overflow:hidden}.card{background:linear-gradient(180deg,#121922,#0f161e);border:1px solid var(--line);border-radius:8px;padding:7px}.top{display:grid;grid-template-columns:minmax(120px,.9fr) minmax(120px,.9fr) minmax(110px,.8fr) minmax(110px,.8fr) auto auto auto auto auto auto;gap:6px;align-items:end;flex:0 0 auto}.top label:not(.switch){font-size:11px}.top label:not(.switch) input{width:100%;height:32px;box-sizing:border-box;font-size:12px;line-height:1.1}.top button{height:32px;min-height:32px;box-sizing:border-box;font-size:12px;line-height:1.1;white-space:nowrap;padding:0 10px}.switch{height:32px;min-height:32px;box-sizing:border-box;display:flex;align-items:center;gap:6px;background:#0c1218;border:1px solid #344455;border-radius:7px;padding:0 8px;white-space:nowrap;font-size:12px;line-height:1.1}.switch input{width:16px;height:16px;margin:0}.switch select{height:26px;min-height:26px;box-sizing:border-box;font-size:12px;line-height:1;padding:2px 24px 2px 7px}.statusbar{display:flex;gap:16px;align-items:center;flex-wrap:wrap;padding:6px 9px;font-size:12px;flex:0 0 auto}.metrics-layout{display:block;min-height:0;flex:0 0 auto}.metrics{display:grid;grid-template-columns:1.08fr .82fr .9fr 1.02fr 1.02fr .75fr 1fr;gap:6px}.metric{background:#0c131a;border:1px solid #263545;padding:8px 11px;border-radius:7px;min-width:0}.metric .muted{font-size:11px;font-weight:700;letter-spacing:.025em}.metric-sub{font-size:11px;margin-top:4px}.muted{color:var(--muted);font-size:11px}.big{font-size:22px;font-weight:750;line-height:1.03;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.workspace{display:grid;grid-template-columns:minmax(0,3fr) minmax(310px,1fr);gap:7px;flex:1 1 0;min-height:0;overflow:hidden}.chartstack{display:grid;grid-template-rows:minmax(0,2.3fr) minmax(0,1fr) minmax(0,1.3fr);gap:6px;min-height:0;overflow:hidden}.chartpane{position:relative;background:#0b1219;border:1px solid #263545;border-radius:7px;padding:5px;min-height:0;overflow:hidden}.charttitle{position:absolute;z-index:2;left:11px;top:6px;color:#c4ced8;font-size:10px;font-weight:800;letter-spacing:.04em}.chartpane canvas{width:100%!important;height:100%!important}.sidepanel{display:flex;flex-direction:column;min-height:0;padding:9px;overflow:hidden}.side-stats{font-size:12px;line-height:1.38;padding-bottom:6px;border-bottom:1px solid #52606d;flex:0 0 auto}.decision-head{display:flex;justify-content:space-between;align-items:center;margin-top:6px;flex:0 0 auto}.decision-head h3{margin:0;font-size:15px}.log{flex:1 1 auto;min-height:0;overflow:auto;margin-top:6px;padding-right:2px}.decision-card{background:#0b1219;border:1px solid #2a3948;border-radius:6px;padding:7px;margin-bottom:5px;font-size:11px;line-height:1.32}.decision-top{display:flex;justify-content:space-between;gap:8px;align-items:center}.decision-time{color:#c7d1db}.badge{display:inline-block;padding:2px 7px;border-radius:4px;font-weight:800;font-size:10px;background:#222}.badge.LONG,.badge.HOLD{color:var(--green)}.badge.SHORT,.badge.EXIT{color:var(--red)}.badge.FLAT{color:#cbd5df}.decision-body{margin-top:4px}.decision-meta{color:var(--muted);margin-top:4px}.footerbar{display:flex;justify-content:space-between;align-items:center;gap:10px;padding:6px 9px;font-size:11px;white-space:nowrap;overflow-x:auto;overflow-y:hidden;flex:0 0 auto;scrollbar-width:thin}.footer-left,.footer-mid,.footer-right{display:flex;gap:16px;align-items:center;flex:0 0 auto}.ok{color:var(--green);font-weight:800}.err{color:var(--red);font-weight:800}.live{color:var(--green);font-weight:800}.sim{color:#a9b7c6}.liveexec{color:#ffb0b0!important;border-color:#8f3030!important;background:#261111!important}.danger{color:var(--red)!important;border-color:#7a3030!important}.arm{color:#baf4cf!important;border-color:#2b8050!important;font-weight:800}.pill{padding:2px 7px;border-radius:99px;background:#0b1219;border:1px solid #344455}input,select,button{background:#0a1016;color:#fff;border:1px solid #3b4c5e;border-radius:6px;padding:6px 8px;font:inherit}button{cursor:pointer}.setupgrid{display:grid;grid-template-columns:1fr 1fr;gap:14px;overflow:auto;flex:1 1 auto;min-height:0;width:100%}.formgrid{display:grid;grid-template-columns:repeat(2,minmax(220px,1fr));gap:12px}.field label{display:block;color:#9aa7b5;font-size:12px;margin-bottom:5px}.field input,.field select{width:100%}.full{grid-column:1/-1}.warn{background:#211b11;border:1px solid #584522;padding:10px;border-radius:8px}.updatebox{border:1px dashed #526170;border-radius:10px;padding:14px}.mono{font-family:ui-monospace,monospace}@media(max-width:1050px){.top{grid-template-columns:repeat(4,1fr)}.switch,.top button{align-self:stretch}.brandmeta{display:none}}@media(max-width:900px),(max-height:720px){body{overflow:auto}.wrap{height:auto;min-height:100vh;min-height:100dvh}.panel.active{display:block;overflow:visible}.mission-shell{height:auto;overflow:visible}.workspace,.metrics-layout,.setupgrid{grid-template-columns:1fr}.workspace{overflow:visible}.chartstack{height:620px;overflow:visible}.top{grid-template-columns:repeat(2,1fr)}.metrics{grid-template-columns:repeat(2,1fr)}.footerbar{flex-wrap:wrap;overflow:visible}.sidepanel{min-height:400px}.setupgrid{height:auto}}
+</style></head><body><div class="wrap">
+<div class="brandbar"><div><h1>🐺 MarketHound {{ version }} <span class="live muted" style="font-size:11px">LIVE AI + LIVE MARKET</span> <span class="muted" style="font-size:11px">/ INTERNAL PAPER ONLY</span></h1><div class="tabs"><button id="missionTabBtn" class="tabbtn active" onclick="showTab('mission')">Mission</button><button id="setupTabBtn" class="tabbtn" onclick="showTab('setup')">Setup / Admin</button></div></div><div class="brandmeta"><span>Mode: <b id="headMode">-</b></span><span>Market: <b id="headMarket">-</b></span><span>Session: <b id="headSession">-</b></span><span>AI: <b id="headAI">-</b></span><span>Evidence: <b id="headEvidence">-</b></span></div></div>
+
+<div id="missionPanel" class="panel active">
+<div class="mission-shell">
+<div class="card top">
+<label>Ticker<br><input id="ticker" value="TSLA"></label><label>Trade Size $<br><input id="size" type="number" value="1000"></label><label>Daily Profit $<br><input id="profit" type="number" value="100"></label><label>Daily Loss $<br><input id="loss" type="number" value="50"></label>
+<label class="switch"><input id="liveMode" type="checkbox" checked><span>LIVE MARKET + AI</span></label><label class="switch liveexec"><span>EXEC</span><select id="executionMode"><option value="PAPER">PAPER</option><option value="LIVE">LIVE</option></select></label><label class="switch"><input id="debugCapture" type="checkbox"><span>DEBUG / EVIDENCE</span></label>
+<button onclick="configure()">Load Mission</button><button class="arm" onclick="startMH()">ARM / START</button><button class="danger" onclick="stopMH()">STOP</button>
+</div>
+<div class="card statusbar"><span>Mode: <b id="mode">-</b></span><span>Market: <b id="market">-</b></span><span>Session: <b id="marketSession">-</b></span><span>AI: <b id="ai">-</b></span><span>Credentials: <b id="creds">-</b></span><span>Evidence: <b id="evidenceStatus">OFF</b></span><span id="error"></span></div>
+<div class="metrics-layout"><div class="metrics">
+<div class="metric"><div class="muted">PRICE</div><div class="big" id="price">-</div><div id="priceChange" class="metric-sub muted">-</div></div>
+<div class="metric"><div class="muted">POSITION</div><div class="big" id="position">-</div></div>
+<div class="metric"><div class="muted">SHARES</div><div class="big" id="shares">0.0000</div></div>
+<div class="metric"><div class="muted">POS VALUE</div><div class="big" id="positionValue">$0.00</div></div>
+<div class="metric"><div class="muted">TOTAL P&amp;L</div><div class="big" id="pnl">-</div><div id="pnlPct" class="metric-sub muted">-</div></div>
+<div class="metric"><div class="muted">RSI (14)</div><div class="big" id="rsi">-</div></div>
+<div class="metric"><div class="muted">ENTRY PRICE</div><div class="big" id="entryKpi">-</div></div>
+</div></div>
+<div class="workspace">
+<div class="chartstack"><div class="chartpane"><div class="charttitle">PRICE / VWAP / SMA5</div><canvas id="priceChart"></canvas></div><div class="chartpane"><div class="charttitle">VOLUME</div><canvas id="volumeChart"></canvas></div><div class="chartpane"><div class="charttitle">RSI (14)</div><canvas id="rsiChart"></canvas></div></div>
+<div class="card sidepanel"><div class="side-stats"><div>VWAP: <b id="vwap">-</b></div><div>SMA5: <b id="sma5">-</b></div><div>Volume ratio: <b id="vr">-</b></div><div>Realized: <b id="realized">-</b></div><div>Unrealized: <b id="unrealized">-</b></div><div>Status: <b id="status">-</b></div></div><div class="decision-head"><h3>AI Decision Log</h3><button onclick="clearDecisionView()">Clear</button></div><div class="log" id="log"></div><div class="decision-meta" id="aiMeta">-</div></div>
+</div>
+<div class="card footerbar"><div class="footer-left"><span>Alpaca: <b id="footAlpaca">-</b></span><span>Data: <b id="footData">-</b></span><span>Last Bar: <b id="footBar">-</b></span><span>Latency: <b id="footLatency">-</b></span><span>Session: <b id="footSession">-</b></span></div><div class="footer-mid"><span>Buying Power: <b id="footBuyingPower">-</b></span><span>Equity: <b id="footEquity">-</b></span><span>Daily P&amp;L: <b id="footPnl">-</b></span></div><div class="footer-right"><span>Session: <b id="footMarketSession">-</b></span><span>Feed: <b id="footMarket">-</b></span><span>◷ <b id="footClock">-</b></span></div></div>
+</div></div>
+
+<div id="setupPanel" class="panel">
+<div class="setupgrid">
+<div class="card"><h2>Application Configuration</h2><div class="formgrid">
+<div class="field"><label>Alpaca API Key</label><input id="cfgAlpacaKey" type="password" placeholder="Leave blank to keep existing"></div>
+<div class="field"><label>Alpaca API Secret</label><input id="cfgAlpacaSecret" type="password" placeholder="Leave blank to keep existing"></div>
+<div class="field"><label>Alpaca Feed</label><select id="cfgFeed"><option value="iex">IEX</option><option value="sip">SIP</option></select></div>
+<div class="field"><label>OpenAI Model</label><input id="cfgModel" value="gpt-5"></div>
+<div class="field full"><label>OpenAI API Key</label><input id="cfgOpenAIKey" type="password" placeholder="Leave blank to keep existing"></div>
+<div class="full warn"><b>LIVE EXECUTION — ALPACA</b><br><span class="muted">Separate live brokerage credentials. LIVE execution is OFF by default. hf11 routes real orders only during MARKET OPEN.</span></div>
+<div class="field"><label>Live Account Label</label><input id="cfgAccountLabel" placeholder="ALPACA LIVE"></div>
+<div class="field"><label>Allow LIVE Execution Control</label><select id="cfgLiveEnabled"><option value="false">DISABLED</option><option value="true">ENABLED</option></select></div>
+<div class="field"><label>Alpaca LIVE API Key</label><input id="cfgLiveKey" type="password" placeholder="Leave blank to keep existing"></div>
+<div class="field"><label>Alpaca LIVE API Secret</label><input id="cfgLiveSecret" type="password" placeholder="Leave blank to keep existing"></div>
+<div class="full"><button type="button" onclick="testBroker()">Test LIVE Account Connection</button> <span id="brokerTestStatus" class="muted"></span></div>
+<div class="field"><label>AI Evaluation Interval (sec)</label><input id="cfgAIInterval" type="number" step="1" min="3"></div>
+<div class="field"><label>Market Poll Interval (sec)</label><input id="cfgPollInterval" type="number" step="1" min="1"></div>
+<div class="field"><label>Default Ticker</label><input id="cfgTicker"></div>
+<div class="field"><label>Default Trade Size $</label><input id="cfgTradeSize" type="number" step="1"></div>
+<div class="field"><label>Default Daily Profit $</label><input id="cfgProfit" type="number" step="1"></div>
+<div class="field"><label>Default Daily Loss $</label><input id="cfgLoss" type="number" step="1"></div>
+<div class="field full"><label class="switch"><input id="cfgDebugDefault" type="checkbox"><span>Enable Debug / Evidence Capture by default</span></label></div>
+</div><p><button onclick="saveSetup()">Save Configuration</button></p><div id="cfgStatus" class="muted"></div>
+<div class="card"><div class="muted">Daily Trade Log</div>
+<div>Reports directory: <span class="mono">/opt/wolfpack/markethound/reports/trades/</span></div>
+<div>Latest report: <span id="tradeReportLatest" class="mono">-</span></div>
+<p><button onclick="downloadTradeReport()">Download Latest Trade Log</button></p>
+<div id="tradeReportStatus" class="muted">One CSV row per completed trade. PAPER and LIVE use the same schema.</div>
+</div>
+<div class="card"><div class="muted">Evidence capture</div><div>Session file: <span id="evidencePath" class="mono">-</span></div><div>Last available: <span id="evidenceLatest" class="mono">-</span></div><p><button onclick="downloadEvidence()">Download Current / Last Evidence</button></p><div id="evidenceDownloadStatus" class="muted"></div><div class="muted">JSONL is append-only and stored under data/debug/. It contains market telemetry, Alpaca request IDs, indicators, AI prompt/state, response metadata, normalized decisions, paper P&amp;L, and errors. API secrets are never included.</div></div>
+<div class="card"><div class="muted">Stored credentials</div><div>Alpaca key: <span id="maskAlpaca" class="mono">-</span></div><div>Alpaca secret: <span id="maskSecret" class="mono">-</span></div><div>OpenAI key: <span id="maskOpenAI" class="mono">-</span></div><div>Alpaca LIVE key: <span id="maskLiveKey" class="mono">-</span></div><div>Alpaca LIVE secret: <span id="maskLiveSecret" class="mono">-</span></div><div class="muted">Secrets are stored locally in MarketHound data/config.json with mode 0600.</div></div>
+</div>
+
+<div class="card"><h2>Update MarketHound</h2><div class="updatebox"><p>Select a MarketHound release ZIP. The updater validates the archive, backs up current application code, overlays the new release, preserves <span class="mono">data/</span> and <span class="mono">.venv/</span>, then refreshes Python requirements.</p><input id="updateZip" type="file" accept=".zip"><p><button onclick="installUpdate()">Install Update ZIP</button></p><div id="updateStatus" class="muted"></div></div>
+<p class="warn"><b>Restart required after an update.</b> The running Python process keeps the old code in memory until MarketHound is stopped and restarted.</p>
+<div class="card"><div>Installed version: <b id="setupVersion">-</b></div><div>Install root: <span id="setupRoot" class="mono">-</span></div><div>Config file: <span id="setupConfig" class="mono">-</span></div></div>
+</div>
+</div>
+</div>
+<script>
+const commonLegend={labels:{color:'#d6dee6',boxWidth:28,font:{size:10}}};
+const axisTicks={color:'#8d99a6',font:{size:9}};
+const priceChart=new Chart(document.getElementById('priceChart'),{
+  type:'line',
+  data:{labels:[],datasets:[
+    {label:'Price',data:[],pointRadius:0,borderWidth:2,borderColor:'#35aef2'},
+    {label:'VWAP',data:[],pointRadius:0,borderWidth:1.5,borderColor:'#ee5f84'},
+    {label:'SMA5',data:[],pointRadius:0,borderWidth:1.5,borderColor:'#f59b3d'}
+  ]},
+  options:{animation:false,responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:commonLegend},scales:{x:{ticks:{...axisTicks,maxTicksLimit:10}},y:{ticks:axisTicks}}}
+});
+const volumeChart=new Chart(document.getElementById('volumeChart'),{
+  type:'bar',
+  data:{labels:[],datasets:[{label:'Volume',data:[],borderWidth:0,backgroundColor:'rgba(53,174,242,.65)'}]},
+  options:{animation:false,responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{x:{ticks:{...axisTicks,maxTicksLimit:10}},y:{beginAtZero:true,ticks:{...axisTicks,callback:v=>Intl.NumberFormat('en',{notation:'compact'}).format(v)}}}}
+});
+const rsiChart=new Chart(document.getElementById('rsiChart'),{
+  type:'line',
+  data:{labels:[],datasets:[
+    {label:'RSI',data:[],pointRadius:0,borderWidth:2,borderColor:'#35aef2'},
+    {label:'Overbought 70',data:[],pointRadius:0,borderWidth:1,borderDash:[6,6],borderColor:'#ee5f84'},
+    {label:'Oversold 30',data:[],pointRadius:0,borderWidth:1,borderDash:[6,6],borderColor:'#f59b3d'}
+  ]},
+  options:{animation:false,responsive:true,maintainAspectRatio:false,interaction:{mode:'index',intersect:false},plugins:{legend:commonLegend},scales:{x:{ticks:{...axisTicks,maxTicksLimit:10}},y:{min:0,max:100,ticks:{...axisTicks,stepSize:20}}}}
+});
+let decisionViewCleared=false;
+function clearDecisionView(){decisionViewCleared=true;log.innerHTML='';}
+function showTab(name){document.querySelectorAll('.panel').forEach(x=>x.classList.remove('active'));document.querySelectorAll('.tabbtn').forEach(x=>x.classList.remove('active'));document.getElementById(name+'Panel').classList.add('active');document.getElementById(name+'TabBtn').classList.add('active');if(name==='setup')loadSetup()}
+async function post(url,body){let opts={method:'POST'};if(body!==undefined){opts.headers={'Content-Type':'application/json'};opts.body=JSON.stringify(body)}let r=await fetch(url,opts);let j=await r.json();if(!r.ok||j.ok===false)throw new Error(j.error||'Request failed');return j}
+async function configure(){decisionViewCleared=false;try{await post('/api/configure',{ticker:ticker.value,trade_size:+size.value,profit_target:+profit.value,loss_limit:+loss.value,live_mode:liveMode.checked,debug_capture:debugCapture.checked,execution_mode:executionMode.value});await refresh()}catch(e){alert(e.message)}}
+async function startMH(){
+  decisionViewCleared=false;
+  try{
+    // ARM always commits the controls currently visible in the cockpit.
+    // This prevents a checked LIVE MARKET + AI switch from starting a previously-loaded SIM mission.
+    if(executionMode.value==='LIVE'){
+      if(!confirm('LIVE EXECUTION WILL ROUTE REAL ORDERS TO ALPACA. Continue?')) return;
+      const typed=prompt('Type LIVE to arm real-money execution:');
+      if(typed!=='LIVE') throw new Error('LIVE execution arm cancelled.');
+    }
+    await post('/api/configure',{ticker:ticker.value,trade_size:+size.value,profit_target:+profit.value,loss_limit:+loss.value,live_mode:liveMode.checked,debug_capture:debugCapture.checked,execution_mode:executionMode.value});
+    await post('/api/start');
+    await refresh();
+  }catch(e){alert(e.message)}
+}
+async function stopMH(){await post('/api/stop')}
+function money(x){return(x>=0?'+':'')+'$'+Number(x).toFixed(2)}
+async function refresh(){try{let s=await(await fetch('/api/state')).json();
+price.textContent='$'+s.price.toFixed(2);
+let pc=Number(s.price_change||0), pcp=Number(s.price_change_pct||0);
+priceChange.textContent=`${pc>=0?'+':''}${pc.toFixed(2)} (${pcp>=0?'+':''}${pcp.toFixed(2)}%)`;
+priceChange.className='metric-sub '+(pc>0?'live':(pc<0?'err':'muted'));
+position.textContent=s.position;
+position.className='big '+(s.position==='LONG'?'live':(s.position==='SHORT'?'err':''));
+shares.textContent=Number(s.qty||0).toLocaleString(undefined,{minimumFractionDigits:4,maximumFractionDigits:4});
+positionValue.textContent='$'+Number(s.position_value||0).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+pnl.textContent=money(s.total_pnl);pnl.className='big '+(s.total_pnl>=0?'live':'err');
+let pp=Number(s.starting_equity||0)?(Number(s.total_pnl||0)/Number(s.starting_equity)*100):0;
+pnlPct.textContent=`${pp>=0?'+':''}${pp.toFixed(2)}%`;pnlPct.className='metric-sub '+(pp>0?'live':(pp<0?'err':'muted'));
+rsi.textContent=s.rsi;
+entryKpi.textContent=s.entry_price?'$'+Number(s.entry_price).toFixed(2):'-';
+vwap.textContent='$'+s.vwap.toFixed(2);sma5.textContent='$'+s.sma5.toFixed(2);vr.textContent=s.volume_ratio+'x';realized.textContent=money(s.realized_pnl);unrealized.textContent=money(s.unrealized_pnl);status.textContent=s.running?'ARMED':'SAFE';
+mode.textContent=s.execution_mode;mode.className=s.execution_mode==='LIVE'?'err':'live';executionMode.value=s.execution_mode;market.textContent=s.market_status;marketSession.textContent=s.market_session;marketSession.className=s.market_session.includes('OPEN')?'live':(s.market_session.includes('STALE')?'err':'sim');ai.textContent=s.ai_status;creds.textContent=`Alpaca ${s.credentials.alpaca?'✓':'✗'} / OpenAI ${s.credentials.openai?'✓':'✗'}`;evidenceStatus.textContent=s.evidence.enabled?'RECORDING':(s.debug_capture?'READY':'OFF');evidenceStatus.className=s.evidence.enabled?'live':'sim';tradeReportLatest.textContent=(s.trade_log&&s.trade_log.latest_filename)?`${s.trade_log.latest_filename} (${Math.max(1,Math.round((s.trade_log.latest_size||0)/1024))} KB)`:'-';evidencePath.textContent=s.evidence.path||'-';evidenceLatest.textContent=s.evidence.latest_filename?`${s.evidence.latest_filename} (${Math.max(1,Math.round((s.evidence.latest_size||0)/1024))} KB)`:'-';error.textContent=s.last_error||'';error.className=s.last_error?'err':'';
+headMode.textContent=mode.textContent;headMarket.textContent=s.market_status;headSession.textContent=s.market_session;headAI.textContent=s.ai_status;headEvidence.textContent=evidenceStatus.textContent;headEvidence.className=evidenceStatus.className;
+const labels=s.series.map(x=>new Date(x.ts).toLocaleTimeString([], {hour:'numeric',minute:'2-digit',second:'2-digit'}));priceChart.data.labels=labels;priceChart.data.datasets[0].data=s.series.map(x=>x.price);priceChart.data.datasets[1].data=s.series.map(x=>x.vwap);priceChart.data.datasets[2].data=s.series.map(x=>x.sma5);priceChart.update('none');volumeChart.data.labels=labels;volumeChart.data.datasets[0].data=s.series.map(x=>x.volume);volumeChart.update('none');rsiChart.data.labels=labels;rsiChart.data.datasets[0].data=s.series.map(x=>x.rsi);rsiChart.data.datasets[1].data=s.series.map(()=>70);rsiChart.data.datasets[2].data=s.series.map(()=>30);rsiChart.update('none');
+if(!decisionViewCleared){log.innerHTML=s.decisions.map(d=>`<div class="decision-card"><div class="decision-top"><span class="decision-time">${new Date(d.ts*1000).toLocaleTimeString()}</span><span><span class="badge ${d.action}">${d.action}</span> &nbsp; Conf: ${(d.confidence/100).toFixed(2)}</span></div><div class="decision-body">Thesis: ${d.thesis||'-'}${d.invalidation?`<br>Invalidation: ${d.invalidation}`:''}</div><div class="decision-meta">$${d.price.toFixed(2)} · VWAP ${d.vwap.toFixed(2)} · SMA5 ${d.sma5.toFixed(2)} · RSI ${d.rsi.toFixed(1)} · VR ${d.volume_ratio.toFixed(2)}x · ${d.source}</div></div>`).join('')}
+let meta=s.last_ai_meta||{};aiMeta.textContent=`Model: ${s.live_mode?s.ai_model:'RULE ENGINE'}   Last ID: ${meta.response_id?meta.response_id.slice(-10):'-'}   Latency: ${meta.latency_ms?Math.round(meta.latency_ms)+'ms':'-'}`;
+footAlpaca.textContent=s.credentials.alpaca?'CONNECTED':'NOT CONFIGURED';footAlpaca.className=s.credentials.alpaca?'ok':'err';footData.textContent=s.live_mode?'LIVE':'SIM';footData.className=s.live_mode?'live':'sim';footBar.textContent=s.last_bar_ts?new Date(s.last_bar_ts).toLocaleTimeString():(s.series.length?new Date(s.series[s.series.length-1].ts).toLocaleTimeString():'-');footLatency.textContent=s.live_mode&&s.market_latency_ms?Math.round(s.market_latency_ms)+'ms':(s.live_mode?'-':'SIM');footBuyingPower.textContent='$'+Number(s.buying_power).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});footEquity.textContent='$'+Number(s.equity).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});footPnl.textContent=money(s.total_pnl)+' ('+((s.total_pnl/s.starting_equity)*100).toFixed(2)+'%)';footPnl.className=s.total_pnl>=0?'ok':'err';footMarketSession.textContent=s.market_session;footMarketSession.className=s.market_session.includes('OPEN')?'live':(s.market_session.includes('STALE')?'err':'sim');footMarket.textContent=s.market_status;footMarket.className=s.live_mode?'live':'sim';if(s.session_started_at){let sec=Math.max(0,Math.floor(Date.now()/1000-s.session_started_at));footSession.textContent=[Math.floor(sec/3600),Math.floor((sec%3600)/60),sec%60].map(x=>String(x).padStart(2,'0')).join(':')}else footSession.textContent='-';footClock.textContent=new Date().toLocaleTimeString();
+}catch(e){error.textContent=e.message;error.className='err'}}
+async function loadSetup(){try{let s=await(await fetch('/api/setup')).json();cfgFeed.value=s.alpaca_feed;cfgModel.value=s.openai_model;cfgAIInterval.value=s.ai_interval_sec;cfgPollInterval.value=s.market_poll_sec;cfgTicker.value=s.default_ticker;cfgTradeSize.value=s.default_trade_size;cfgProfit.value=s.default_profit_target;cfgLoss.value=s.default_loss_limit;cfgDebugDefault.checked=!!s.default_debug_capture;cfgAccountLabel.value=s.alpaca_account_label||'ALPACA LIVE';cfgLiveEnabled.value=s.live_execution_enabled?'true':'false';if(!debugCapture.dataset.userchanged)debugCapture.checked=!!s.default_debug_capture;maskAlpaca.textContent=s.alpaca_key_masked||'not configured';maskSecret.textContent=s.alpaca_secret_masked||'not configured';maskOpenAI.textContent=s.openai_key_masked||'not configured';maskLiveKey.textContent=s.alpaca_live_key_masked||'not configured';maskLiveSecret.textContent=s.alpaca_live_secret_masked||'not configured';setupVersion.textContent=s.version;setupRoot.textContent=s.app_root;setupConfig.textContent=s.config_path;cfgStatus.textContent=s.running?'Stop MarketHound before changing settings.':'';if(!ticker.dataset.userchanged){ticker.value=s.default_ticker;size.value=s.default_trade_size;profit.value=s.default_profit_target;loss.value=s.default_loss_limit}}catch(e){cfgStatus.textContent=e.message;cfgStatus.className='err'}}
+async function saveSetup(){cfgStatus.className='muted';cfgStatus.textContent='Saving...';try{let j=await post('/api/setup',{alpaca_key:cfgAlpacaKey.value,alpaca_secret:cfgAlpacaSecret.value,alpaca_feed:cfgFeed.value,openai_key:cfgOpenAIKey.value,openai_model:cfgModel.value,ai_interval_sec:+cfgAIInterval.value,market_poll_sec:+cfgPollInterval.value,default_ticker:cfgTicker.value,default_trade_size:+cfgTradeSize.value,default_profit_target:+cfgProfit.value,default_loss_limit:+cfgLoss.value,default_debug_capture:cfgDebugDefault.checked,alpaca_account_label:cfgAccountLabel.value,live_execution_enabled:cfgLiveEnabled.value==='true',alpaca_live_key:cfgLiveKey.value,alpaca_live_secret:cfgLiveSecret.value});cfgAlpacaKey.value='';cfgAlpacaSecret.value='';cfgOpenAIKey.value='';cfgLiveKey.value='';cfgLiveSecret.value='';cfgStatus.textContent='Configuration saved.';cfgStatus.className='ok';await loadSetup();await refresh()}catch(e){cfgStatus.textContent=e.message;cfgStatus.className='err'}}
+async function testBroker(){brokerTestStatus.className='muted';brokerTestStatus.textContent='Testing...';try{let j=await post('/api/broker/test',{});brokerTestStatus.textContent=`Connected · status ${j.account.status||'-'} · acct …${j.account.account_number_tail||'----'} · equity $${Number(j.account.equity||0).toLocaleString()} · buying power $${Number(j.account.buying_power||0).toLocaleString()}${j.account.trading_blocked?' · TRADING BLOCKED':''}`;brokerTestStatus.className=j.account.trading_blocked?'err':'ok'}catch(e){brokerTestStatus.textContent=e.message;brokerTestStatus.className='err'}}
+async function downloadTradeReport(){
+  tradeReportStatus.className='muted';
+  tradeReportStatus.textContent='Preparing trade log...';
+  try{
+    const r=await fetch('/api/reports/trades/download',{cache:'no-store'});
+    if(!r.ok){
+      let msg='Trade-log download failed.';
+      try{const j=await r.json();msg=j.error||msg}catch(_){}
+      throw new Error(msg);
+    }
+    const blob=await r.blob();
+    const cd=r.headers.get('content-disposition')||'';
+    const m=cd.match(/filename="?([^";]+)"?/i);
+    const filename=m?m[1]:'markethound-trades.csv';
+    const url=URL.createObjectURL(blob);
+    const link=document.createElement('a');
+    link.href=url;link.download=filename;
+    document.body.appendChild(link);link.click();link.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),2000);
+    tradeReportStatus.textContent=`Downloaded ${filename}.`;
+    tradeReportStatus.className='ok';
+  }catch(e){
+    tradeReportStatus.textContent=e.message;
+    tradeReportStatus.className='err';
+  }
+}
+async function downloadEvidence(){
+  evidenceDownloadStatus.className='muted';
+  evidenceDownloadStatus.textContent='Preparing evidence download...';
+  try{
+    const statResp=await fetch('/api/debug/status',{cache:'no-store'});
+    const stat=await statResp.json();
+    if(!statResp.ok||stat.ok===false||!stat.available){
+      throw new Error(stat.error||'No evidence file exists yet. Enable DEBUG / EVIDENCE before ARM / START and run a session.');
+    }
+    const r=await fetch('/api/debug/download',{cache:'no-store'});
+    if(!r.ok){
+      let msg='Evidence download failed.';
+      try{const j=await r.json();msg=j.error||msg}catch(_){}
+      throw new Error(msg);
+    }
+    const blob=await r.blob();
+    if(!blob.size)throw new Error('Evidence file was empty.');
+    const cd=r.headers.get('content-disposition')||'';
+    const m=cd.match(/filename="?([^";]+)"?/i);
+    const filename=m?m[1]:(stat.latest_filename||'markethound-evidence.jsonl');
+    const url=URL.createObjectURL(blob);
+    const link=document.createElement('a');
+    link.href=url;link.download=filename;
+    document.body.appendChild(link);link.click();link.remove();
+    setTimeout(()=>URL.revokeObjectURL(url),2000);
+    evidenceDownloadStatus.textContent=`Downloaded ${filename} (${Math.max(1,Math.round(blob.size/1024))} KB).`;
+    evidenceDownloadStatus.className='ok';
+  }catch(e){
+    evidenceDownloadStatus.textContent=e.message;
+    evidenceDownloadStatus.className='err';
+  }
+}
+async function installUpdate(){let f=updateZip.files[0];if(!f){alert('Select an update ZIP first.');return}if(!confirm(`Install ${f.name}? MarketHound must be restarted afterward.`))return;updateStatus.className='muted';updateStatus.textContent='Installing update...';let fd=new FormData();fd.append('update_zip',f);try{let r=await fetch('/api/update',{method:'POST',body:fd});let j=await r.json();if(!r.ok||j.ok===false)throw new Error(j.error||'Update failed');updateStatus.textContent=`Installed. Backup: ${j.result.backup}. ${j.result.pip}. Restart MarketHound now.`;updateStatus.className='ok'}catch(e){updateStatus.textContent=e.message;updateStatus.className='err'}}
+['ticker','size','profit','loss'].forEach(id=>document.getElementById(id).addEventListener('input',()=>ticker.dataset.userchanged='1'));debugCapture.addEventListener('change',()=>debugCapture.dataset.userchanged='1');
+setInterval(refresh,1000);loadSetup();refresh();
+</script></body></html>

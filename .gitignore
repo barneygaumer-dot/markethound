@@ -1,0 +1,29 @@
+
+.env
+*.env
+data/debug/
+reports/trades/
+__pycache__/
+*.pyc
+.venv/
+
+.env
+*.env
+data/debug/
+reports/trades/
+__pycache__/
+*.pyc
+.venv/
+
+# MarketHound secrets / runtime state
+data/config.json
+data/backups/
+data/debug/
+reports/
+.env
+*.env
+
+# Python/runtime
+.venv/
+__pycache__/
+*.pyc
