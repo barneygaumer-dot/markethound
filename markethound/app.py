@@ -10,7 +10,7 @@ from .engine import MarketHoundEngine
 from .updater import AppUpdater, UpdateError
 
 APP_ROOT = Path(__file__).resolve().parents[1]
-VERSION = "1.2-hf26"
+VERSION = "1.2-hf44"
 config_store = AppConfig()
 engine = MarketHoundEngine(config_store.values)
 updater = AppUpdater(APP_ROOT)
@@ -34,8 +34,26 @@ def create_app():
     def configure():
         data = request.get_json(force=True)
         try:
-            engine.configure(data.get('ticker','TSLA'), data.get('trade_size',1000), data.get('profit_target',100), data.get('loss_limit',50), data.get('live_mode',False), data.get('debug_capture', None), data.get('execution_mode','PAPER'))
+            engine.configure(data.get('ticker','TSLA'), data.get('trade_size',1000), data.get('profit_target',100), data.get('loss_limit',50), data.get('live_mode',False), data.get('debug_capture', None), data.get('execution_mode','PAPER'), data.get('allow_shorts', True))
             return jsonify({'ok':True})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)}), 400
+
+    @app.post('/api/observe')
+    def observe():
+        data = request.get_json(force=True) or {}
+        try:
+            engine.observe(data.get('ticker','TSLA'), data.get('live_mode',True))
+            return jsonify({'ok':True})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e)}), 400
+
+    @app.post('/api/shorts')
+    def shorts_roe():
+        data = request.get_json(force=True) or {}
+        try:
+            allowed = engine.set_allow_shorts(data.get('allow_shorts', True))
+            return jsonify({'ok':True, 'allow_shorts':allowed})
         except Exception as e:
             return jsonify({'ok':False,'error':str(e)}), 400
 
@@ -61,6 +79,16 @@ def create_app():
             return jsonify({'ok':True, 'flat': True, 'state': state})
         except Exception as e:
             return jsonify({'ok':False,'error':str(e), 'flat': engine.position == 'FLAT'}), 409
+
+
+    @app.post('/api/human/entry')
+    def human_entry():
+        data = request.get_json(force=True) or {}
+        try:
+            result = engine.human_enter(data.get('direction', ''))
+            return jsonify({'ok': True, 'entry': result})
+        except Exception as e:
+            return jsonify({'ok': False, 'error': str(e)}), 409
 
 
     @app.get('/api/debug/status')

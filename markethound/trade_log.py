@@ -59,6 +59,36 @@ class DailyTradeLog:
                     pass
             return path
 
+
+    def realized_for_date(self, trade_date=None, execution_mode: str | None = None) -> float:
+        """Return cumulative realized P&L for one New York trading date.
+
+        The completed-trade CSV is the durable source of truth, so this value
+        survives mission reloads and application restarts. PAPER and LIVE are
+        intentionally kept separate when execution_mode is supplied.
+        """
+        with self.lock:
+            if trade_date is None:
+                trade_date = datetime.now(NY).date()
+            date_text = trade_date.isoformat() if hasattr(trade_date, "isoformat") else str(trade_date)
+            path = self.root / f"markethound-trades-{date_text}.csv"
+            if not path.exists() or path.stat().st_size == 0:
+                return 0.0
+            wanted_mode = str(execution_mode or "").upper().strip()
+            total = 0.0
+            try:
+                with path.open("r", newline="", encoding="utf-8") as f:
+                    for row in csv.DictReader(f):
+                        if wanted_mode and str(row.get("execution_mode", "")).upper().strip() != wanted_mode:
+                            continue
+                        try:
+                            total += float(row.get("realized_pnl", 0) or 0)
+                        except (TypeError, ValueError):
+                            continue
+            except Exception:
+                return 0.0
+            return round(total, 6)
+
     def latest_file(self) -> Optional[Path]:
         with self.lock:
             files = [p for p in self.root.glob("markethound-trades-*.csv") if p.is_file()]

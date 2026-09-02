@@ -539,10 +539,48 @@ class OpenAIDecisionEngine:
         instructions = """You are MarketHound's tactical PAPER-TRADING decision engine.
 You are receiving live market telemetry for exactly one human-selected stock.
 Decide only among LONG, SHORT, HOLD, EXIT, FLAT. Never change trade size, ticker,
-daily profit target, or daily loss limit. Consider price relative to VWAP and the
-5-day SMA, RSI, volume ratio, recent prices, current paper position, and P&L.
+armed-session profit target, or armed-session loss limit. Consider price relative to VWAP and the
+5-day SMA, RSI, volume ratio, recent prices, the tactical 1-minute candle window and its structural summary,
+current position, session P&L, cumulative Daily P&L context, the full-session price/trend context,
+and the open trade's MFE/MAE/profit-giveback + momentum-health telemetry when present.
+Use the tactical candle window to reason about LOCATION BEFORE DIRECTION: recent swing highs/lows, repeated rejection/reclaim areas,
+range position, VWAP/SMA interactions, candle progression, and whether participation is expanding or fading. Candle structure is supporting
+confirmation, not a standalone trigger.
+
+PRICE-ACTION / REGIME DOCTRINE:
+- PRICE TREND AND STRUCTURE COME FIRST. Indicators describe/qualify what price is doing; they do not overrule sustained observed price behavior.
+- Use session_trend_context to understand the longer battlefield while tactical_candles_1m describe the local fight.
+- VWAP and SMA5 are reference levels/context, NOT standalone LONG/SHORT signals. A print below VWAP alone is never sufficient reason to SHORT.
+- Repeated two-way VWAP crossings reduce VWAP's directional authority and usually imply balance/chop until price establishes acceptance or a confirmed break.
+- In a balanced/contested-VWAP regime, be especially selective with new SHORT entries. Require actual bearish price structure plus confirmation
+  (for example persistent lower highs/lows, failed reclaim + support break/retest, or a confirmed reversal structure such as double-top/H&S).
+  A named chart pattern is not required, but bearish control must be demonstrated rather than inferred from location below a reference line.
+- Repeated inability to stay above SMA5 is legitimate overhead-resistance context, but does not by itself justify shorting from the middle of a range.
+- Weight price structure/location first, then participation/volume, momentum, and indicator confirmation.
+
+OPEN-POSITION MOMENTUM MANAGEMENT:
+- momentum_health is advisory evidence for deciding HOLD versus EXIT; it is NOT a deterministic trailing stop.
+- While favorable price progress continues and structure/participation remain healthy, HOLDing a winner is allowed even after meaningful MFE.
+- After meaningful MFE, actively watch for the impulse to STOP PAYING: several completed bars without a new favorable extreme, flattening or
+  adverse trade-direction price progress, repeated rejection, candle/range compression, and/or fading participation.
+- Prefer EXIT to ring the register when momentum deterioration is PERSISTENT AND CONFLUENT before a large retracement develops.
+- Do NOT exit because of one contrary candle, one noisy tick, a tiny stall, or a fixed dollar/percentage giveback. Require persistence/confluence.
+- EXIT does not mean the larger thesis reversed; it may simply mean the local scalp impulse is exhausted. MarketHound may re-enter later on a fresh setup.
+
+SESSION SCALPING DOCTRINE:
+- The armed-session Profit Target is the cumulative session finish line, NOT a required profit for any single trade.
+- You may reach the session target through multiple smaller profitable scalps.
+- Do NOT hold a profitable trade merely because it has not reached the full remaining session target.
+- When an open trade has bankable profit and continuation evidence weakens, momentum/participation deteriorates,
+  price reaches nearby structure, or giveback from MFE becomes unattractive, prefer EXIT to bank partial session progress.
+- Do NOT use a fixed per-trade dollar take-profit. Let structure, participation, momentum, MFE, and giveback determine whether to bank.
+- Strong, well-supported continuation may justify HOLDing a winner; do not mechanically scalp every green trade.
+- After a profitable EXIT, MarketHound remains armed and may take another qualified setup until the session Profit Target
+  or Loss Limit is reached. Avoid forcing entries merely to complete the target. FLAT is always acceptable when no quality setup exists.
+
 HOLD means maintain an existing position. EXIT means flatten an existing position.
 LONG/SHORT may only be used when currently FLAT. FLAT means take no position.
+The state includes allow_shorts. If allow_shorts is false, SHORT is prohibited: do not return SHORT; bearish setups must remain FLAT or manage an existing position normally.
 Return ONLY compact valid JSON with keys: action, confidence, thesis, invalidation.
 confidence must be integer 0-100. thesis and invalidation must each be <= 240 chars.
 MarketHound may be running in PAPER or LIVE execution mode. You decide only the tactical action; deterministic MarketHound controls decide whether an allowed action is routed."""
@@ -582,6 +620,47 @@ MarketHound may be running in PAPER or LIVE execution mode. You decide only the 
             },
         }
 
+    def review_human_entry(self, state: dict, direction: str, entry_price: float) -> dict:
+        """Review a human operator entry without issuing or changing any trade action."""
+        if not self.ready:
+            raise RuntimeError("OPENAI_API_KEY is not configured.")
+        instructions = """You are MarketHound's tactical AI wingman reviewing a trade the HUMAN OPERATOR has already entered.
+Do NOT issue an order and do NOT change the position. Evaluate the human entry using the supplied telemetry: entry location, price versus VWAP and 5-day SMA, RSI, volume ratio, recent prices, session, and current P&L.
+The state may include allow_shorts=false; that flag restricts AI-initiated SHORT entries only and does not invalidate a HUMAN SHORT. Judge the technical quality of the human entry itself.
+Return ONLY compact valid JSON with keys: verdict, confidence, thesis, invalidation.
+verdict must be SUPPORT, CAUTION, or OPPOSE. confidence must be integer 0-100.
+thesis and invalidation must each be <= 240 chars. Explain what is good or bad about the HUMAN entry at its actual entry price."""
+        review_state = dict(state)
+        review_state["human_operator_action"] = str(direction).upper().strip()
+        review_state["human_entry_price"] = round(float(entry_price), 6)
+        input_text = json.dumps(review_state, separators=(",", ":"))
+        started = time.perf_counter()
+        response = self._client_obj().responses.create(
+            model=self.model, instructions=instructions, input=input_text, store=False,
+        )
+        latency_ms = round((time.perf_counter() - started) * 1000, 2)
+        raw_output = response.output_text
+        obj = self._extract_json(raw_output)
+        verdict = str(obj.get("verdict", "CAUTION")).upper().strip()
+        if verdict not in {"SUPPORT", "CAUTION", "OPPOSE"}:
+            verdict = "CAUTION"
+        confidence = max(0, min(100, int(obj.get("confidence", 0))))
+        usage = getattr(response, "usage", None)
+        if hasattr(usage, "model_dump"):
+            try: usage = usage.model_dump()
+            except Exception: usage = str(usage)
+        return {
+            "verdict": verdict,
+            "confidence": confidence,
+            "thesis": str(obj.get("thesis", ""))[:240],
+            "invalidation": str(obj.get("invalidation", ""))[:240],
+            "_debug": {
+                "model": self.model, "response_id": getattr(response, "id", ""),
+                "latency_ms": latency_ms, "usage": usage, "instructions": instructions,
+                "input_state": review_state, "input_json": input_text, "raw_output": raw_output,
+            },
+        }
+
 
 class MarketHoundEngine:
     """Paper-execution lab engine with selectable SIM or LIVE market/AI inputs."""
@@ -589,15 +668,17 @@ class MarketHoundEngine:
     def __init__(self, app_config: Optional[dict] = None):
         self.lock = threading.RLock()
         app_config = app_config or {}
-        self.running = False
+        self.running = False  # Reaper armed/trading authority
+        self.observing = False  # Market telemetry/chart authority
         self.thread: Optional[threading.Thread] = None
         self.ticker = str(app_config.get("default_ticker", "TSLA")).upper()
         self.trade_size = float(app_config.get("default_trade_size", 1000.0))
         self.starting_equity = 100000.0
-        self.daily_profit_target = float(app_config.get("default_profit_target", 100.0))
-        self.daily_loss_limit = -abs(float(app_config.get("default_loss_limit", 50.0)))
+        self.profit_target = float(app_config.get("default_profit_target", 100.0))
+        self.loss_limit = -abs(float(app_config.get("default_loss_limit", 50.0)))
         self.live_mode = False
         self.execution_mode = "PAPER"
+        self.allow_shorts = True  # Human ROE: may Luna open new SHORT positions?
         self.start_price = 350.0
         self.last_price = self.start_price
         self.ticks: Deque[Tick] = deque(maxlen=2400)
@@ -609,8 +690,16 @@ class MarketHoundEngine:
         self.position = "FLAT"
         self.qty = 0.0
         self.entry_price = 0.0
-        self.realized_pnl = 0.0
+        self.realized_pnl = 0.0  # Current mission realized P&L
+        self.daily_realized_pnl = 0.0  # Durable trading-day realized P&L
+        self._pnl_date_et = datetime.now(NY).date()
         self.unrealized_pnl = 0.0
+        # Per-open-trade excursion telemetry for Luna's scalp management.
+        # These are advisory inputs only; deterministic ROE remains session target/loss limit.
+        self.trade_mfe_pnl = 0.0
+        self.trade_mae_pnl = 0.0
+        self.trade_mfe_price = 0.0
+        self.trade_mae_price = 0.0
         self.decisions: Deque[Decision] = deque(maxlen=300)
         self.cumulative_pv = 0.0
         self.cumulative_volume = 0
@@ -641,6 +730,7 @@ class MarketHoundEngine:
         app_root = Path(__file__).resolve().parents[1]
         self.evidence = EvidenceRecorder(app_root / "data" / "debug")
         self.trade_log = DailyTradeLog(app_root / "reports" / "trades")
+        self.daily_realized_pnl = self.trade_log.realized_for_date(self._pnl_date_et, self.execution_mode)
         self.open_trade = None
         self._seed_initial_history()
 
@@ -649,8 +739,10 @@ class MarketHoundEngine:
         with self.lock:
             if self.running:
                 raise RuntimeError("Stop MarketHound before changing application settings.")
+        was_observing = self.observing
+        self._stop_observation()
+        with self.lock:
             self.alpaca = AlpacaMarketData(app_config)
-            self.stream.stop()
             self.stream = AlpacaLiveStream(app_config)
             self.broker = AlpacaTradingClient(app_config)
             self.ai = OpenAIDecisionEngine(app_config)
@@ -664,14 +756,16 @@ class MarketHoundEngine:
             self.debug_capture = bool(app_config.get("default_debug_capture", self.debug_capture))
             self.ticker = str(app_config.get("default_ticker", self.ticker)).upper().strip() or self.ticker
             self.trade_size = max(1.0, float(app_config.get("default_trade_size", self.trade_size)))
-            self.daily_profit_target = abs(float(app_config.get("default_profit_target", self.daily_profit_target)))
-            self.daily_loss_limit = -abs(float(app_config.get("default_loss_limit", abs(self.daily_loss_limit))))
+            self.profit_target = abs(float(app_config.get("default_profit_target", self.profit_target)))
+            self.loss_limit = -abs(float(app_config.get("default_loss_limit", abs(self.loss_limit))))
             self.market_status = f"ALPACA {self.alpaca.feed.upper()}" if self.live_mode else "SIMULATOR"
             self.market_session = self._session_label() if self.live_mode else "SIMULATOR"
             self.ai_status = f"OPENAI {self.ai.model}" if self.live_mode else "RULE ENGINE"
             self.data_source = f"ALPACA {self.alpaca.feed.upper()} LIVE STREAM BARS" if self.live_mode else "SIMULATOR"
             self.price_source = f"ALPACA {self.alpaca.feed.upper()} LIVE STREAM TRADE" if self.live_mode else "SIMULATOR"
             self.indicator_source = f"ALPACA {self.alpaca.feed.upper()} LIVE STREAM BARS" if self.live_mode else "SIMULATOR"
+        if was_observing:
+            self._start_observation()
 
     def _reset_market_state(self):
         self.ticks.clear(); self.closes.clear(); self.minute_volumes.clear()
@@ -751,14 +845,42 @@ class MarketHoundEngine:
             self.ticks.append(tick)
         self.last_price = price
 
-    def configure(self, ticker: str, trade_size: float, profit_target: float, loss_limit: float, live_mode: bool = False, debug_capture: Optional[bool] = None, execution_mode: str = "PAPER"):
+    def observe(self, ticker: str, live_mode: bool = True):
+        """Select a ticker for continuous chart telemetry without arming Reaper."""
+        with self.lock:
+            if self.running:
+                raise RuntimeError("Cannot change observed ticker while Reaper is armed.")
+        self._stop_observation()
+        with self.lock:
+            self.ticker = str(ticker or "").upper().strip() or self.ticker
+            self.live_mode = bool(live_mode)
+            if self.live_mode:
+                if not self.alpaca.ready:
+                    raise RuntimeError("LIVE observation requires Alpaca market-data credentials.")
+                self.market_status = f"ALPACA {self.alpaca.feed.upper()}"
+                self.market_session = self._session_label()
+                self.ai_status = f"OPENAI {self.ai.model}"
+                self.data_source = f"ALPACA {self.alpaca.feed.upper()} LIVE STREAM BARS"
+                self.price_source = f"ALPACA {self.alpaca.feed.upper()} LIVE STREAM TRADE"
+                self.indicator_source = f"ALPACA {self.alpaca.feed.upper()} LIVE STREAM BARS"
+            else:
+                self.market_status = "SIMULATOR"; self.market_session = "SIMULATOR"; self.ai_status = "RULE ENGINE"
+                self.data_source = "SIMULATOR"; self.price_source = "SIMULATOR"; self.indicator_source = "SIMULATOR"
+                self._seed_initial_history()
+        self._start_observation()
+
+    def configure(self, ticker: str, trade_size: float, profit_target: float, loss_limit: float, live_mode: bool = False, debug_capture: Optional[bool] = None, execution_mode: str = "PAPER", allow_shorts: bool = True):
+        # A loaded ticker is always observed. Reconfiguration replaces the old
+        # observation stream but does not arm Reaper.
         with self.lock:
             if self.running:
                 raise RuntimeError("Stop MarketHound before loading a new mission.")
+        self._stop_observation()
+        with self.lock:
             self.ticker = ticker.upper().strip() or "TSLA"
             self.trade_size = max(1.0, float(trade_size))
-            self.daily_profit_target = abs(float(profit_target))
-            self.daily_loss_limit = -abs(float(loss_limit))
+            self.profit_target = abs(float(profit_target))
+            self.loss_limit = -abs(float(loss_limit))
             self.live_mode = bool(live_mode)
             requested_exec = str(execution_mode or "PAPER").upper().strip()
             if requested_exec not in {"PAPER","LIVE"}:
@@ -771,10 +893,15 @@ class MarketHoundEngine:
                 if not self.broker.ready:
                     raise RuntimeError("LIVE execution requires separate Alpaca LIVE trading credentials.")
             self.execution_mode = requested_exec
+            self.allow_shorts = bool(allow_shorts)
             if debug_capture is not None:
                 self.debug_capture = bool(debug_capture)
             self.position = "FLAT"; self.qty = 0.0; self.entry_price = 0.0
             self.realized_pnl = 0.0; self.unrealized_pnl = 0.0
+            self.trade_mfe_pnl = 0.0; self.trade_mae_pnl = 0.0
+            self.trade_mfe_price = 0.0; self.trade_mae_price = 0.0
+            self._pnl_date_et = datetime.now(NY).date()
+            self.daily_realized_pnl = self.trade_log.realized_for_date(self._pnl_date_et, self.execution_mode)
             self.decisions.clear(); self.last_error = ""; self.last_decision_at = 0.0
             if self.live_mode:
                 if not self.alpaca.ready:
@@ -792,30 +919,66 @@ class MarketHoundEngine:
                 self.data_source = "SIMULATOR"; self.price_source = "SIMULATOR"; self.indicator_source = "SIMULATOR"
                 self.daily_closes = deque([338.0, 341.5, 345.2, 348.1, 350.0], maxlen=20)
                 self._seed_initial_history()
+        self._start_observation()
+
+    def _start_observation(self):
+        """Keep market telemetry/charting alive independently of Reaper ARM state."""
+        with self.lock:
+            if self.observing:
+                return
+            if self.live_mode:
+                self._seed_live()
+                self.stream.start(self.ticker)
+            self.observing = True
+            self.thread = threading.Thread(target=self._loop, daemon=True)
+            self.thread.start()
+
+    def _stop_observation(self):
+        """Stop only the telemetry worker; used for ticker/config replacement."""
+        with self.lock:
+            self.observing = False
+        self.stream.stop()
+        t = self.thread
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=3.0)
+        self.thread = None
+
+
+    def set_allow_shorts(self, allowed: bool):
+        """Human ROE toggle. Blocks new SHORT entries; never auto-flattens an existing SHORT."""
+        with self.lock:
+            self.allow_shorts = bool(allowed)
+            self.evidence.write("shorts_roe_changed", {"allow_shorts": self.allow_shorts, "position": self.position, "state": self._evidence_state()})
+            return self.allow_shorts
 
     def start(self):
         with self.lock:
             if self.running: return
-            if self.live_mode:
-                self._seed_live()
-                self.stream.start(self.ticker)
+            if not self.observing:
+                self._start_observation()
             if self.execution_mode == "LIVE":
                 self._sync_broker(force=True)
                 if not self.broker_account:
                     raise RuntimeError("Unable to read Alpaca LIVE account.")
+            # Every ARM / START establishes a fresh ROE session. Daily P&L is
+            # durable accounting only and remains untouched here.
+            self.realized_pnl = 0.0
+            self.unrealized_pnl = 0.0 if self.position == "FLAT" else self.unrealized_pnl
+            if self.position == "FLAT":
+                self.trade_mfe_pnl = 0.0; self.trade_mae_pnl = 0.0
+                self.trade_mfe_price = 0.0; self.trade_mae_price = 0.0
             if self.debug_capture:
                 self.evidence.start({
                     "ticker": self.ticker, "execution_mode": self.execution_mode, "data_mode": "LIVE" if self.live_mode else "SIM",
                     "market": self.market_status, "ai": self.ai_status, "trade_size": self.trade_size,
-                    "daily_profit_target": self.daily_profit_target, "daily_loss_limit": self.daily_loss_limit,
+                    "profit_target": self.profit_target, "loss_limit": self.loss_limit,
+                    "allow_shorts": self.allow_shorts,
                     "ai_interval_sec": self.ai_interval, "market_poll_sec": self.live_poll_interval,
                     "market_stream": f"{self.stream.BASE}/{self.alpaca.feed}",
                 })
                 self.evidence.write("initial_state", self._evidence_state())
             self.running = True
             self.session_started_at = time.time()
-            self.thread = threading.Thread(target=self._loop, daemon=True)
-            self.thread.start()
 
     def stop(self):
         """Orderly human stop: prevent new entries, flatten, then disarm."""
@@ -831,7 +994,7 @@ class MarketHoundEngine:
                 self.evidence.write("human_stop_result", {"flat": flat, "state_after": self._evidence_state()})
                 self.evidence.write("final_state", self._evidence_state())
                 self.evidence.close("manual_stop" if flat else "manual_stop_flatten_failed")
-        self.stream.stop()
+        # Observation stays alive after STOP; only trading authority is removed.
         if not flat:
             raise RuntimeError("STOP FAILED — POSITION STILL OPEN")
 
@@ -846,10 +1009,95 @@ class MarketHoundEngine:
             flat = self.position == "FLAT"
             after = self._evidence_state()
             self.evidence.write("human_flatten_result", {"flat": flat, "state_after": after})
-        self.stream.stop()
+        # Observation stays alive after FLATTEN NOW.
         if not flat:
             raise RuntimeError("FLATTEN FAILED — POSITION STILL OPEN")
         return after
+
+    def human_enter(self, direction: str):
+        """Human operator market entry. Requires an armed, flat mission.
+
+        Human SHORT is command authority and is intentionally independent of the
+        ALLOW SHORTS toggle, which constrains Luna's decision-making only.
+        """
+        direction = str(direction or "").upper().strip()
+        if direction not in {"LONG", "SHORT"}:
+            raise RuntimeError("Human entry direction must be LONG or SHORT.")
+        with self.lock:
+            self._ensure_daily_pnl_rollover()
+            if not self.running:
+                raise RuntimeError("ARM / START the mission before using a human market entry.")
+            if self.position != "FLAT":
+                raise RuntimeError(f"Human entry blocked: position is already {self.position}.")
+            if self._check_session_limits():
+                raise RuntimeError("Human entry blocked: armed-session ROE limit has already been reached.")
+            entry_market_price = float(self.last_price or 0.0)
+            if entry_market_price <= 0:
+                raise RuntimeError("Human entry blocked: no valid market price is available.")
+            if self.execution_mode == "LIVE":
+                routed = self._route_live_action(direction, "Human operator market entry.", enforce_short_roe=False)
+                # Alpaca market orders can be acknowledged just before the new
+                # position becomes visible. Give the broker a brief bounded
+                # reconciliation window before declaring the entry failed.
+                if routed in {"LONG", "SHORT"} and self.position == "FLAT":
+                    for _ in range(8):
+                        time.sleep(0.25)
+                        self._sync_broker(force=True)
+                        if self.position != "FLAT":
+                            break
+                if routed not in {"LONG", "SHORT"} or self.position == "FLAT":
+                    raise RuntimeError("Human LIVE market entry was submitted but no broker position was confirmed.")
+            else:
+                self.position = direction
+                self.qty = self.trade_size / entry_market_price
+                self.entry_price = entry_market_price
+                self._update_pnl()
+            actual_entry = float(self.entry_price or entry_market_price)
+            self._record(direction, 100, "Human operator market entry.", "HUMAN")
+            self.evidence.write("human_market_entry", {
+                "direction": direction, "entry_price": actual_entry,
+                "allow_shorts_for_ai": self.allow_shorts, "state_after": self._evidence_state(),
+            })
+            review_state = self._ai_state()
+
+        # Never delay or gate the human order on an AI opinion. Review happens
+        # after the position exists and has zero execution authority.
+        threading.Thread(
+            target=self._review_human_entry,
+            args=(direction, actual_entry, review_state), daemon=True,
+        ).start()
+        return {"direction": direction, "entry_price": round(actual_entry, 6), "position": self.position}
+
+    def _review_human_entry(self, direction: str, entry_price: float, review_state: dict):
+        if not (self.live_mode and self.ai.ready):
+            with self.lock:
+                self._record(
+                    "REVIEW", 0,
+                    f"HUMAN {direction} @ ${entry_price:.2f} | AI review unavailable in simulator/rule-engine mode.",
+                    "SYSTEM",
+                )
+            return
+        try:
+            d = self.ai.review_human_entry(review_state, direction, entry_price)
+            with self.lock:
+                self.last_ai_meta = dict(d.get("_debug", {}))
+                thesis = f"HUMAN {direction} @ ${entry_price:.2f} | {d['verdict']} | {d['thesis']}"
+                self._record("REVIEW", d["confidence"], thesis, "OPENAI REVIEW", d["invalidation"])
+                self.evidence.write("human_entry_ai_review", {
+                    "direction": direction, "entry_price": entry_price,
+                    "review": {k:d[k] for k in ("verdict", "confidence", "thesis", "invalidation")},
+                    "request": d.get("_debug", {}),
+                })
+        except Exception as ex:
+            with self.lock:
+                self._record(
+                    "REVIEW", 0,
+                    f"HUMAN {direction} @ ${entry_price:.2f} | AI review failed: {ex}",
+                    "SYSTEM",
+                )
+                self.evidence.write("human_entry_ai_review_failed", {
+                    "direction": direction, "entry_price": entry_price, "error": str(ex),
+                })
 
     def _seed_live(self):
         seed = self.alpaca.seed(self.ticker)
@@ -936,7 +1184,7 @@ class MarketHoundEngine:
     def _loop(self):
         while True:
             with self.lock:
-                if not self.running: break
+                if not self.observing: break
             try:
                 if self.live_mode: self._live_tick()
                 else: self._generate_tick()
@@ -973,7 +1221,8 @@ class MarketHoundEngine:
             self.ticks.append(tick)
             self._update_pnl()
             self.evidence.write("market_snapshot", {"source": "SIMULATOR", "tick": asdict(tick), "state": self._evidence_state()})
-            self._maybe_decide_rules()
+            if self.running:
+                self._maybe_decide_rules()
 
     def _live_tick(self):
         stream_state = self.stream.snapshot()
@@ -988,11 +1237,11 @@ class MarketHoundEngine:
                 self._update_pnl()
 
                 # Deterministic ROE must not wait for a completed minute bar or
-                # the next AI evaluation. Enforce daily boundaries immediately
+                # the next AI evaluation. Enforce armed-session boundaries immediately
                 # when the live trade stream moves realized + unrealized P&L
-                # through either mission limit.
-                if self._check_daily_limits():
-                    self.evidence.write("daily_limit_enforced_realtime", {
+                # through either session limit.
+                if self.running and self._check_session_limits():
+                    self.evidence.write("session_limit_enforced_realtime", {
                         "trade_price": round(self.last_price, 6),
                         "state_after": self._evidence_state(),
                     })
@@ -1066,7 +1315,7 @@ class MarketHoundEngine:
                         "last_bar_ts": self.last_bar_ts,
                         "volume_telemetry": dict(self.last_volume_telemetry),
                     })
-                else:
+                elif self.running:
                     self._maybe_decide_ai()
 
     def _vwap(self) -> float:
@@ -1174,7 +1423,7 @@ class MarketHoundEngine:
                 "market_value":f("market_value"),"unrealized_pl":f("unrealized_pl"),
                 "current_price":f("current_price")}
 
-    def _route_live_action(self, action: str, thesis: str) -> str:
+    def _route_live_action(self, action: str, thesis: str, enforce_short_roe: bool = True) -> str:
         if self.execution_mode != "LIVE":
             return action
         self._sync_broker(force=True)
@@ -1183,6 +1432,9 @@ class MarketHoundEngine:
         if self.broker_account.get("trading_blocked"):
             raise RuntimeError("LIVE order blocked: Alpaca account reports trading_blocked.")
         if action in {"LONG","SHORT"}:
+            if action == "SHORT" and enforce_short_roe and not self.allow_shorts:
+                self.evidence.write("short_entry_blocked", {"ticker": self.ticker, "price": self.last_price, "thesis": thesis, "execution_mode": self.execution_mode})
+                return "FLAT"
             if self.broker_position:
                 return "HOLD"
             qty = max(0.000001, self.trade_size / max(self.last_price, 0.01))
@@ -1200,9 +1452,24 @@ class MarketHoundEngine:
         return action
 
     def _update_pnl(self):
-        if self.position=="LONG": self.unrealized_pnl=(self.last_price-self.entry_price)*self.qty
-        elif self.position=="SHORT": self.unrealized_pnl=(self.entry_price-self.last_price)*self.qty
-        else: self.unrealized_pnl=0.0
+        if self.position=="LONG":
+            self.unrealized_pnl=(self.last_price-self.entry_price)*self.qty
+        elif self.position=="SHORT":
+            self.unrealized_pnl=(self.entry_price-self.last_price)*self.qty
+        else:
+            self.unrealized_pnl=0.0
+            return
+
+        # Track maximum favorable/adverse excursion for the current open trade.
+        # MFE/MAE are advisory context for Luna; they never bypass deterministic ROE.
+        if self.open_trade is not None:
+            pnl = float(self.unrealized_pnl)
+            if pnl > self.trade_mfe_pnl:
+                self.trade_mfe_pnl = pnl
+                self.trade_mfe_price = float(self.last_price)
+            if pnl < self.trade_mae_pnl:
+                self.trade_mae_pnl = pnl
+                self.trade_mae_price = float(self.last_price)
 
     def _trade_open_if_needed(self, action: str, confidence: int, thesis: str, source: str):
         if action not in {"LONG","SHORT"} or self.open_trade is not None:
@@ -1210,6 +1477,10 @@ class MarketHoundEngine:
         if self.position not in {"LONG","SHORT"} or self.qty <= 0 or self.entry_price <= 0:
             return
         ts = time.time()
+        self.trade_mfe_pnl = max(0.0, float(self.unrealized_pnl))
+        self.trade_mae_pnl = min(0.0, float(self.unrealized_pnl))
+        self.trade_mfe_price = float(self.last_price)
+        self.trade_mae_price = float(self.last_price)
         self.open_trade = {
             "trade_id": self.trade_log.next_trade_id(self.ticker, ts),
             "_entry_ts": ts,
@@ -1225,7 +1496,7 @@ class MarketHoundEngine:
             "entry_source": source,
             "entry_confidence": int(confidence),
             "entry_reason": thesis,
-            "ai_model": self.ai.model if source == "OPENAI" else "RULE ENGINE",
+            "ai_model": self.ai.model if source in {"OPENAI", "OPENAI REVIEW"} else ("HUMAN OPERATOR" if source == "HUMAN" else "RULE ENGINE"),
             "data_source": self.data_source,
             "entry_vwap": round(self._vwap(), 6),
             "entry_sma5": round(self._sma5(), 6),
@@ -1270,11 +1541,43 @@ class MarketHoundEngine:
         self.evidence.write("trade_closed", {
             "trade": {k: row.get(k, "") for k in self.trade_log.FIELDS},
             "report_path": str(path),
+            "excursion": {
+                "mfe_pnl": round(self.trade_mfe_pnl, 2),
+                "mae_pnl": round(self.trade_mae_pnl, 2),
+                "profit_giveback": round(max(0.0, self.trade_mfe_pnl - max(0.0, pnl)), 2),
+                "mfe_price": round(self.trade_mfe_price, 6),
+                "mae_price": round(self.trade_mae_price, 6),
+            },
         })
         self.open_trade = None
+        self.trade_mfe_pnl = 0.0
+        self.trade_mae_pnl = 0.0
+        self.trade_mfe_price = 0.0
+        self.trade_mae_price = 0.0
+
+    def _ensure_daily_pnl_rollover(self):
+        """Roll durable Daily P&L at midnight New York time."""
+        today_et = datetime.now(NY).date()
+        if today_et != self._pnl_date_et:
+            self._pnl_date_et = today_et
+            self.daily_realized_pnl = self.trade_log.realized_for_date(today_et, self.execution_mode)
+            self.evidence.write("daily_pnl_rollover", {
+                "trade_date": today_et.isoformat(),
+                "execution_mode": self.execution_mode,
+                "daily_realized_pnl": round(self.daily_realized_pnl, 6),
+            })
+
+    def _refresh_daily_realized_pnl(self):
+        self._ensure_daily_pnl_rollover()
+        self.daily_realized_pnl = self.trade_log.realized_for_date(self._pnl_date_et, self.execution_mode)
 
     def _flatten(self, reason: str, source: str = "SYSTEM"):
         if self.position=="FLAT": return
+        direction = self.position
+        entry_price = float(self.entry_price or 0.0)
+        exit_price = float(self.last_price or 0.0)
+        qty = float(self.qty or 0.0)
+        est_pnl = ((exit_price-entry_price)*qty) if direction=="LONG" else ((entry_price-exit_price)*qty)
         if self.execution_mode == "LIVE":
             try:
                 self._route_live_action("EXIT", reason)
@@ -1283,83 +1586,459 @@ class MarketHoundEngine:
                 self._record("HOLD",0,f"LIVE EXIT FAILED: {ex}","SYSTEM")
                 return
             self._trade_close_if_open(99, reason, source)
-            self._record("EXIT",99,reason,source)
+            self.realized_pnl += est_pnl
+            self._refresh_daily_realized_pnl()
+            self._record("EXIT",99,f"Exit ${exit_price:.2f} | {direction} | Est. P&L {est_pnl:+.2f} | {reason}",source)
             return
         self._trade_close_if_open(99, reason, source)
-        self.realized_pnl += self.unrealized_pnl; self.position="FLAT"; self.qty=0.0; self.entry_price=0.0; self.unrealized_pnl=0.0
-        self._record("EXIT",99,reason,source)
+        self.realized_pnl += self.unrealized_pnl
+        self._refresh_daily_realized_pnl()
+        self.position="FLAT"; self.qty=0.0; self.entry_price=0.0; self.unrealized_pnl=0.0
+        self._record("EXIT",99,f"Exit ${exit_price:.2f} | {direction} | Realized {est_pnl:+.2f} | {reason}",source)
 
     def _record(self, action: str, confidence: int, thesis: str, source: str, invalidation: str = ""):
+        display_thesis = thesis
         if action in {"LONG","SHORT"}:
             self._trade_open_if_needed(action, confidence, thesis, source)
+            display_thesis = f"ENTRY ${self.entry_price:.2f} | {action} | {thesis}"
         elif action == "EXIT":
             self._trade_close_if_open(confidence, thesis, source)
-        decision = Decision(time.time(),action,confidence,thesis,self.last_price,self._vwap(),self._sma5(),self._rsi(),self._volume_ratio(),source,invalidation)
+        decision = Decision(time.time(),action,confidence,display_thesis,self.last_price,self._vwap(),self._sma5(),self._rsi(),self._volume_ratio(),source,invalidation)
         self.decisions.append(decision)
         self.evidence.write("decision_applied", {"decision": asdict(decision), "state_after": self._evidence_state()})
 
-    def _check_daily_limits(self) -> bool:
-        total=self.realized_pnl+self.unrealized_pnl
-        if total>=self.daily_profit_target:
-            self._flatten("Daily profit target reached; paper weapons safe.","SYSTEM"); self.running=False; return True
-        if total<=self.daily_loss_limit:
-            self._flatten("Daily loss limit reached; paper trading halted.","SYSTEM"); self.running=False; return True
+    def _check_session_limits(self) -> bool:
+        """Enforce ROE against only the current armed session.
+
+        Daily P&L is accounting/telemetry only and never blocks a fresh ARM.
+        Session P&L resets to zero each time ARM / START establishes new
+        trading authority, then accumulates realized + current unrealized P&L
+        until that armed session ends.
+        """
+        total = self.realized_pnl + self.unrealized_pnl
+        if total >= self.profit_target:
+            self._flatten("Session profit target reached; weapons safe.", "SYSTEM")
+            self.running = False
+            return True
+        if total <= self.loss_limit:
+            self._flatten("Session loss limit reached; trading authority removed.", "SYSTEM")
+            self.running = False
+            return True
         return False
 
     def _maybe_decide_rules(self):
         now=time.time()
         if now-self.last_decision_at<4: return
         self.last_decision_at=now
-        if self._check_daily_limits(): return
+        if self._check_session_limits(): return
         p=self.last_price; vwap=self._vwap(); sma5=self._sma5(); rsi=self._rsi(); vr=self._volume_ratio()
         bullish=p>vwap and p>sma5 and rsi>=53 and vr>=0.9; bearish=p<vwap and p<sma5 and rsi<=47 and vr>=0.9
         if self.position=="LONG" and (p<vwap or rsi<48): self._flatten("Long thesis invalidated: VWAP/RSI deterioration.","RULES")
         elif self.position=="SHORT" and (p>vwap or rsi>52): self._flatten("Short thesis invalidated: VWAP/RSI deterioration.","RULES")
         elif self.position=="FLAT" and bullish:
             self.position="LONG"; self.qty=self.trade_size/p; self.entry_price=p; self._record("LONG",80,"Price above VWAP and SMA5 with supportive RSI/volume.","RULES")
-        elif self.position=="FLAT" and bearish:
+        elif self.position=="FLAT" and bearish and self.allow_shorts:
             self.position="SHORT"; self.qty=self.trade_size/p; self.entry_price=p; self._record("SHORT",80,"Price below VWAP and SMA5 with weak RSI and active volume.","RULES")
+        elif self.position=="FLAT" and bearish and not self.allow_shorts:
+            self._record("FLAT",80,"SHORT setup identified but SHORT entries are disabled by operator ROE.","SYSTEM")
         else: self._record("HOLD" if self.position!="FLAT" else "FLAT",60,"No higher-conviction state change.","RULES")
 
     def _evidence_state(self) -> dict:
         return {
-            "ticker": self.ticker, "running": self.running, "live_mode": self.live_mode, "execution_mode": self.execution_mode,
+            "ticker": self.ticker, "running": self.running, "live_mode": self.live_mode, "execution_mode": self.execution_mode, "allow_shorts": self.allow_shorts,
             "price": round(self.last_price, 6), "vwap": round(self._vwap(), 6),
             "sma5": round(self._sma5(), 6), "rsi": round(self._rsi(), 4),
             "volume_ratio": round(self._volume_ratio(), 6), "volume_telemetry": dict(self.last_volume_telemetry), "position": self.position,
             "qty": round(self.qty, 8), "entry_price": round(self.entry_price, 6),
             "realized_pnl": round(self.realized_pnl, 6), "unrealized_pnl": round(self.unrealized_pnl, 6),
             "total_pnl": round(self.realized_pnl + self.unrealized_pnl, 6),
+            "daily_realized_pnl": round(self.daily_realized_pnl, 6),
+            "daily_total_pnl": round(self.daily_realized_pnl + self.unrealized_pnl, 6),
+            "daily_pnl_date_et": self._pnl_date_et.isoformat(),
             "starting_equity": round(self.starting_equity, 2),
             "equity": round(self.starting_equity + self.realized_pnl + self.unrealized_pnl, 2),
             "buying_power": round(self.starting_equity + self.realized_pnl - (self.trade_size if self.position != "FLAT" else 0.0), 2),
-            "daily_profit_target": self.daily_profit_target, "daily_loss_limit": self.daily_loss_limit,
+            "profit_target": self.profit_target, "loss_limit": self.loss_limit,
             "market_status": self.market_status, "market_session": self.market_session,
             "data_source": self.data_source, "price_source": self.price_source,
             "indicator_source": self.indicator_source, "bar_age_sec": round(self.last_bar_age_sec, 2),
             "ai_status": self.ai_status, "last_bar_ts": self.last_bar_ts,
         }
 
+    def _tactical_context(self, max_bars: int = 60) -> tuple[list[dict], dict]:
+        """Compact same-session 1-minute battlefield memory for Luna.
+
+        The chart may contain several historical sessions for indicator context, but
+        tactical AI memory must never silently bridge yesterday into today or mix
+        PREMARKET / MARKET OPEN / AFTER HOURS. Return at most the newest max_bars
+        completed candles from the active New York session plus a small deterministic
+        structural summary. This is advisory AI context only; it does not alter ROE.
+        """
+        now_et = datetime.now(NY)
+        active_date = now_et.date()
+        active_session = self.market_session
+        selected = []
+        for t in reversed(self.ticks):
+            try:
+                dt_et = datetime.fromtimestamp(float(t.ts), timezone.utc).astimezone(NY)
+            except Exception:
+                continue
+            if dt_et.date() != active_date:
+                continue
+            if self._session_label(dt_et) != active_session:
+                continue
+            # In LIVE mode ticks representing completed bars carry OHLC. Ignore
+            # raw trade-only observations so Luna receives one-minute structure.
+            if t.open is None or t.high is None or t.low is None or t.close is None:
+                continue
+            selected.append(t)
+            if len(selected) >= max_bars:
+                break
+        selected.reverse()
+
+        candles = [{
+            "t": datetime.fromtimestamp(float(t.ts), timezone.utc).astimezone(NY).isoformat(timespec="minutes"),
+            "o": round(float(t.open), 4), "h": round(float(t.high), 4),
+            "l": round(float(t.low), 4), "c": round(float(t.close), 4),
+            "v": int(t.volume), "vwap": round(float(t.vwap), 4),
+            "sma5": round(float(t.sma5), 4), "rsi": round(float(t.rsi), 2),
+        } for t in selected]
+
+        def window_stats(n: int) -> dict:
+            w = candles[-n:]
+            if not w:
+                return {"bars": 0}
+            first, last = w[0], w[-1]
+            closes = [x["c"] for x in w]
+            vols = [x["v"] for x in w]
+            change = last["c"] - first["c"]
+            return {
+                "bars": len(w),
+                "change": round(change, 4),
+                "change_pct": round((change / first["c"] * 100.0) if first["c"] else 0.0, 3),
+                "high": round(max(x["h"] for x in w), 4),
+                "low": round(min(x["l"] for x in w), 4),
+                "range": round(max(x["h"] for x in w) - min(x["l"] for x in w), 4),
+                "avg_volume": round(sum(vols) / len(vols), 1),
+            }
+
+        summary = {
+            "bars_available": len(candles),
+            "window_15m": window_stats(15),
+            "window_30m": window_stats(30),
+            "window_60m": window_stats(60),
+        }
+        if candles:
+            last = candles[-1]
+            highs = [x["h"] for x in candles]
+            lows = [x["l"] for x in candles]
+            session_high, session_low = max(highs), min(lows)
+            span = session_high - session_low
+            summary.update({
+                "last_close": last["c"],
+                "range_high": round(session_high, 4),
+                "range_low": round(session_low, 4),
+                "range_position_pct": round(((last["c"] - session_low) / span * 100.0) if span > 0 else 50.0, 1),
+                "distance_to_vwap": round(last["c"] - last["vwap"], 4),
+                "distance_to_sma5": round(last["c"] - last["sma5"], 4),
+            })
+            recent30 = candles[-30:]
+            crosses = 0
+            prev_side = None
+            for x in recent30:
+                side = 1 if x["c"] > x["vwap"] else (-1 if x["c"] < x["vwap"] else 0)
+                if side and prev_side and side != prev_side:
+                    crosses += 1
+                if side:
+                    prev_side = side
+            summary["vwap_crosses_30m"] = crosses
+            if len(candles) >= 20:
+                prior = candles[-20:-10]
+                recent = candles[-10:]
+                pv = sum(x["v"] for x in prior) / max(1, len(prior))
+                rv = sum(x["v"] for x in recent) / max(1, len(recent))
+                summary["volume_trend_10m_vs_prior_10m"] = round((rv / pv) if pv > 0 else 0.0, 3)
+        return candles, summary
+
+    @staticmethod
+    def _linear_slope(values: list[float]) -> float:
+        """Simple least-squares slope per bar; deterministic context only."""
+        n = len(values)
+        if n < 2:
+            return 0.0
+        x_mean = (n - 1) / 2.0
+        y_mean = sum(values) / n
+        den = sum((i - x_mean) ** 2 for i in range(n))
+        if den <= 0:
+            return 0.0
+        return sum((i - x_mean) * (v - y_mean) for i, v in enumerate(values)) / den
+
+    def _session_trend_context(self, max_bars: int = 390) -> dict:
+        """Longer-horizon same-day price structure for Luna.
+
+        During regular hours this is the regular session from the opening bell to now.
+        During after-hours it deliberately keeps the completed regular session as the
+        strategic backdrop while _tactical_context() remains session-local. Premarket
+        uses premarket only. This context is advisory and never changes deterministic ROE.
+        """
+        now_et = datetime.now(NY)
+        active_date = now_et.date()
+        if self.market_session in {"MARKET OPEN", "AFTER HOURS"}:
+            target_session = "MARKET OPEN"
+        else:
+            target_session = self.market_session
+
+        bars = []
+        for t in self.ticks:
+            try:
+                dt_et = datetime.fromtimestamp(float(t.ts), timezone.utc).astimezone(NY)
+            except Exception:
+                continue
+            if dt_et.date() != active_date or self._session_label(dt_et) != target_session:
+                continue
+            if t.open is None or t.high is None or t.low is None or t.close is None:
+                continue
+            bars.append(t)
+        bars = bars[-max_bars:]
+        if not bars:
+            return {"session": target_session, "bars": 0}
+
+        closes = [float(t.close) for t in bars]
+        highs = [float(t.high) for t in bars]
+        lows = [float(t.low) for t in bars]
+        vwaps = [float(t.vwap) for t in bars]
+        sma5s = [float(t.sma5) for t in bars]
+        first, last = bars[0], bars[-1]
+        session_open = float(first.open)
+        last_close = float(last.close)
+        high = max(highs); low = min(lows); span = high - low
+
+        def side_stats(reference_values: list[float], name: str) -> dict:
+            sides = []
+            for c, r in zip(closes, reference_values):
+                sides.append(1 if c > r else (-1 if c < r else 0))
+            nonzero = [x for x in sides if x]
+            above = sum(1 for x in nonzero if x > 0)
+            below = sum(1 for x in nonzero if x < 0)
+            crosses = 0
+            prev = None
+            longest_above = longest_below = run = 0
+            run_side = None
+            for side in sides:
+                if side and prev and side != prev:
+                    crosses += 1
+                if side:
+                    prev = side
+                if side and side == run_side:
+                    run += 1
+                elif side:
+                    run_side = side; run = 1
+                else:
+                    run = 0; run_side = None
+                if run_side == 1:
+                    longest_above = max(longest_above, run)
+                elif run_side == -1:
+                    longest_below = max(longest_below, run)
+            current_side = 0
+            current_run = 0
+            for side in reversed(sides):
+                if not side:
+                    if current_run:
+                        break
+                    continue
+                if current_side == 0:
+                    current_side = side; current_run = 1
+                elif side == current_side:
+                    current_run += 1
+                else:
+                    break
+            total = max(1, len(nonzero))
+            out = {
+                "crosses": crosses,
+                "pct_closes_above": round(above / total * 100.0, 1),
+                "pct_closes_below": round(below / total * 100.0, 1),
+                "longest_above_bars": longest_above,
+                "longest_below_bars": longest_below,
+                "current_side": "ABOVE" if current_side > 0 else ("BELOW" if current_side < 0 else "AT"),
+                "current_side_bars": current_run,
+            }
+            if name == "vwap":
+                pct_above = above / total * 100.0
+                # Current sustained acceptance can supersede an earlier day of
+                # crossing/chop; otherwise frequent two-way crossings remain a
+                # strong balanced-regime clue.
+                if current_side > 0 and current_run >= 8 and pct_above >= 55.0:
+                    out["regime_hint"] = "ACCEPTED_ABOVE"
+                elif current_side < 0 and current_run >= 8 and pct_above <= 45.0:
+                    out["regime_hint"] = "ACCEPTED_BELOW"
+                elif crosses >= 4 and 30.0 <= pct_above <= 70.0:
+                    out["regime_hint"] = "BALANCED_CONTESTED"
+                else:
+                    out["regime_hint"] = "MIXED"
+            return out
+
+        def window_change(n: int) -> dict:
+            w = closes[-n:]
+            if not w:
+                return {"bars": 0}
+            ch = w[-1] - w[0]
+            return {
+                "bars": len(w),
+                "change": round(ch, 4),
+                "change_pct": round((ch / w[0] * 100.0) if w[0] else 0.0, 3),
+                "slope_per_bar": round(self._linear_slope(w), 5),
+            }
+
+        net = last_close - session_open
+        slope = self._linear_slope(closes)
+        # This is a descriptive hint, not an execution gate. Keep the deadband
+        # wide enough that ordinary range noise is not mislabeled as trend.
+        trend_strength = abs(net) / span if span > 0 else 0.0
+        if net > 0 and slope > 0 and trend_strength >= 0.30:
+            trend_hint = "UP"
+        elif net < 0 and slope < 0 and trend_strength >= 0.30:
+            trend_hint = "DOWN"
+        else:
+            trend_hint = "BALANCED_OR_TRANSITION"
+
+        return {
+            "session": target_session,
+            "bars": len(bars),
+            "open": round(session_open, 4),
+            "last_close": round(last_close, 4),
+            "high": round(high, 4),
+            "low": round(low, 4),
+            "range": round(span, 4),
+            "change": round(net, 4),
+            "change_pct": round((net / session_open * 100.0) if session_open else 0.0, 3),
+            "range_position_pct": round(((last_close - low) / span * 100.0) if span > 0 else 50.0, 1),
+            "slope_per_bar": round(slope, 5),
+            "trend_hint": trend_hint,
+            "window_30m": window_change(30),
+            "window_60m": window_change(60),
+            "window_120m": window_change(120),
+            "vwap_behavior": side_stats(vwaps, "vwap"),
+            "sma5_behavior": side_stats(sma5s, "sma5"),
+        }
+
+    def _momentum_health(self) -> dict:
+        """Advisory open-trade impulse telemetry; never a hard exit rule."""
+        if self.position not in {"LONG", "SHORT"} or not self.open_trade:
+            return {"state": "NO_OPEN_TRADE"}
+        try:
+            entry_ts = float(self.open_trade.get("_entry_ts", 0.0))
+        except Exception:
+            entry_ts = 0.0
+        sign = 1.0 if self.position == "LONG" else -1.0
+        bars = []
+        for t in self.ticks:
+            if float(t.ts) < entry_ts:
+                continue
+            if t.open is None or t.high is None or t.low is None or t.close is None:
+                continue
+            bars.append(t)
+        bars = bars[-30:]
+        if not bars:
+            return {
+                "state": "DEVELOPING",
+                "completed_bars_since_entry": 0,
+                "capture_pct_of_mfe": round((max(0.0, self.unrealized_pnl) / self.trade_mfe_pnl * 100.0) if self.trade_mfe_pnl > 0 else 0.0, 1),
+            }
+
+        closes = [float(t.close) for t in bars]
+        vols = [float(t.volume) for t in bars]
+        ranges = [max(0.0, float(t.high) - float(t.low)) for t in bars]
+        favorable_extremes = [float(t.high) if sign > 0 else -float(t.low) for t in bars]
+        best_idx = max(range(len(favorable_extremes)), key=lambda i: favorable_extremes[i])
+        bars_since_best = len(bars) - 1 - best_idx
+
+        def signed_change(n: int) -> float:
+            w = closes[-n:]
+            if len(w) < 2:
+                return 0.0
+            return sign * (w[-1] - w[0])
+
+        recent_pairs = list(zip(closes[-5:-1], closes[-4:])) if len(closes) >= 2 else []
+        favorable_closes = sum(1 for a, b in recent_pairs if sign * (b - a) > 0)
+        adverse_closes = sum(1 for a, b in recent_pairs if sign * (b - a) < 0)
+        recent_r = ranges[-3:]
+        prior_r = ranges[-6:-3]
+        recent_v = vols[-3:]
+        prior_v = vols[-6:-3]
+        range_ratio = (sum(recent_r) / len(recent_r)) / (sum(prior_r) / len(prior_r)) if recent_r and prior_r and sum(prior_r) > 0 else 1.0
+        volume_ratio = (sum(recent_v) / len(recent_v)) / (sum(prior_v) / len(prior_v)) if recent_v and prior_v and sum(prior_v) > 0 else 1.0
+        mfe = max(0.0, float(self.trade_mfe_pnl))
+        current_profit = max(0.0, float(self.unrealized_pnl))
+        capture = (current_profit / mfe * 100.0) if mfe > 0 else 0.0
+        giveback = max(0.0, mfe - current_profit)
+        giveback_pct = (giveback / mfe * 100.0) if mfe > 0 else 0.0
+
+        # State is deliberately conservative: STALLING requires several bars
+        # without a new favorable extreme plus non-positive short-horizon progress.
+        # REVERSING requires additional adverse-closing persistence. It is still
+        # advisory; Luna decides HOLD/EXIT using the full context.
+        state = "ADVANCING"
+        if len(bars) < 3:
+            state = "DEVELOPING"
+        elif bars_since_best >= 3 and signed_change(3) <= 0:
+            state = "STALLING"
+            if bars_since_best >= 4 and signed_change(5) < 0 and adverse_closes >= 3:
+                state = "REVERSING"
+
+        return {
+            "state": state,
+            "completed_bars_since_entry": len(bars),
+            "bars_since_favorable_extreme": bars_since_best,
+            "signed_price_progress_3bar": round(signed_change(3), 4),
+            "signed_price_progress_5bar": round(signed_change(5), 4),
+            "favorable_closes_last4": favorable_closes,
+            "adverse_closes_last4": adverse_closes,
+            "recent_range_vs_prior3": round(range_ratio, 3),
+            "recent_volume_vs_prior3": round(volume_ratio, 3),
+            "mfe_pnl": round(mfe, 2),
+            "current_unrealized_pnl": round(float(self.unrealized_pnl), 2),
+            "capture_pct_of_mfe": round(capture, 1),
+            "giveback_pnl": round(giveback, 2),
+            "giveback_pct_of_mfe": round(giveback_pct, 1),
+        }
+
     def _ai_state(self) -> dict:
         recent=list(self.ticks)[-20:]
+        tactical_candles, tactical_summary = self._tactical_context(60)
+        session_trend_context = self._session_trend_context(390)
+        momentum_health = self._momentum_health()
         return {
-            "ticker":self.ticker,"position":self.position,"execution_mode":self.execution_mode,"price":round(self.last_price,4),
+            "ticker":self.ticker,"position":self.position,"execution_mode":self.execution_mode,"allow_shorts":self.allow_shorts,"price":round(self.last_price,4),
             "vwap":round(self._vwap(),4),"sma5":round(self._sma5(),4),"rsi":round(self._rsi(),2),
             "volume_ratio":round(self._volume_ratio(),3),"volume_telemetry":dict(self.last_volume_telemetry),"trade_size":self.trade_size,
-            "daily_realized_pnl":round(self.realized_pnl,2),"daily_unrealized_pnl":round(self.unrealized_pnl,2),
-            "daily_profit_target":self.daily_profit_target,"daily_loss_limit":self.daily_loss_limit,
+            "session_realized_pnl":round(self.realized_pnl,2),"session_unrealized_pnl":round(self.unrealized_pnl,2),
+            "session_total_pnl":round(self.realized_pnl + self.unrealized_pnl,2),
+            "profit_target":self.profit_target,"loss_limit":self.loss_limit,
+            "session_remaining_profit":round(max(0.0, self.profit_target - self.realized_pnl),2),
+            "session_progress_pct":round((self.realized_pnl / self.profit_target * 100.0) if self.profit_target > 0 else 0.0,2),
+            "open_trade_mfe_pnl":round(self.trade_mfe_pnl,2),
+            "open_trade_mae_pnl":round(self.trade_mae_pnl,2),
+            "open_trade_profit_giveback":round(max(0.0, self.trade_mfe_pnl - max(0.0, self.unrealized_pnl)),2),
+            "open_trade_mfe_price":round(self.trade_mfe_price,4),
+            "open_trade_mae_price":round(self.trade_mae_price,4),
+            "open_trade_hold_seconds":round(max(0.0, time.time() - float(self.open_trade.get("_entry_ts", time.time()))),1) if self.open_trade else 0.0,
+            "daily_realized_pnl":round(self.daily_realized_pnl,2),
             "market_session":self.market_session,"last_bar_ts":self.last_bar_ts,
             "bar_age_sec":round(self.last_bar_age_sec,2),
             "data_source":self.data_source,"price_source":self.price_source,
             "indicator_source":self.indicator_source,
             "recent_prices":[round(t.price,4) for t in recent],
+            "tactical_candles_1m": tactical_candles,
+            "tactical_summary": tactical_summary,
+            "session_trend_context": session_trend_context,
+            "momentum_health": momentum_health,
         }
 
     def _maybe_decide_ai(self):
         now=time.time()
         if now-self.last_decision_at<self.ai_interval: return
         self.last_decision_at=now
-        if self._check_daily_limits(): return
+        if self._check_session_limits(): return
         ai_state = self._ai_state()
         self.evidence.write("ai_evaluation_start", {"model": self.ai.model, "input_state": ai_state, "state": self._evidence_state()})
         d=self.ai.decide(ai_state); action=d["action"]
@@ -1370,6 +2049,10 @@ class MarketHoundEngine:
             "state_before_apply": self._evidence_state(),
         })
         # State-contract enforcement: model decides; deterministic MarketHound validates routing.
+        if self.position == "FLAT" and action == "SHORT" and not self.allow_shorts:
+            self.evidence.write("short_entry_blocked", {"ticker": self.ticker, "price": self.last_price, "thesis": d["thesis"], "execution_mode": self.execution_mode})
+            self._record("FLAT", d["confidence"], f"SHORT BLOCKED BY OPERATOR ROE — {d['thesis']}", "SYSTEM", d["invalidation"])
+            return
         if self.execution_mode == "LIVE":
             try:
                 action = self._route_live_action(action, d["thesis"])
@@ -1380,14 +2063,16 @@ class MarketHoundEngine:
             if action == "EXIT":
                 self._record("EXIT",d["confidence"],d["thesis"],"OPENAI",d["invalidation"]); return
         else:
+            position_before = self.position
+            entered = False
             if self.position=="FLAT" and action=="LONG":
-                self.position="LONG"; self.qty=self.trade_size/self.last_price; self.entry_price=self.last_price
+                self.position="LONG"; self.qty=self.trade_size/self.last_price; self.entry_price=self.last_price; entered = True
             elif self.position=="FLAT" and action=="SHORT":
-                self.position="SHORT"; self.qty=self.trade_size/self.last_price; self.entry_price=self.last_price
+                self.position="SHORT"; self.qty=self.trade_size/self.last_price; self.entry_price=self.last_price; entered = True
             elif self.position!="FLAT" and action=="EXIT":
                 self._flatten(d["thesis"] or "AI ordered exit.","OPENAI"); return
         if self.position=="FLAT" and action=="HOLD": action="FLAT"
-        elif self.position!="FLAT" and action in {"LONG","SHORT","FLAT"}: action="HOLD"
+        elif self.position!="FLAT" and action in {"LONG","SHORT","FLAT"} and not (self.execution_mode == "PAPER" and entered): action="HOLD"
         self._record(action,d["confidence"],d["thesis"],"OPENAI",d["invalidation"])
 
     @staticmethod
@@ -1407,6 +2092,7 @@ class MarketHoundEngine:
 
     def snapshot(self) -> Dict:
         with self.lock:
+            self._ensure_daily_pnl_rollover()
             self._refresh_market_session()
             points = list(self.ticks)[-2400:] if self.live_mode else list(self.ticks)[-240:]
             decisions = list(self.decisions)[-40:]
@@ -1430,8 +2116,10 @@ class MarketHoundEngine:
             return {
                 "ticker": self.ticker,
                 "running": self.running,
+                "observing": self.observing,
                 "live_mode": self.live_mode,
                 "execution_mode": self.execution_mode,
+                "allow_shorts": self.allow_shorts,
                 "data_mode": "LIVE" if self.live_mode else "SIM",
                 "price": round(self.last_price, 2),
                 "vwap": round(self._vwap(), 2),
@@ -1457,13 +2145,16 @@ class MarketHoundEngine:
                 "unrealized_pnl": round(self.unrealized_pnl, 2),
                 "realized_pnl": round(self.realized_pnl, 2),
                 "total_pnl": round(self.realized_pnl + self.unrealized_pnl, 2),
+                "daily_realized_pnl": round(self.daily_realized_pnl, 2),
+                "daily_total_pnl": round(self.daily_realized_pnl + self.unrealized_pnl, 2),
+                "daily_pnl_date_et": self._pnl_date_et.isoformat(),
                 "starting_equity": round(self.starting_equity, 2),
                 "equity": round(float((self.broker_account or {}).get("equity",0) or 0),2) if self.execution_mode=="LIVE" else round(self.starting_equity + self.realized_pnl + self.unrealized_pnl, 2),
                 "buying_power": round(float((self.broker_account or {}).get("buying_power",0) or 0),2) if self.execution_mode=="LIVE" else round(self.starting_equity + self.realized_pnl - (self.trade_size if self.position != "FLAT" else 0.0), 2),
                 "market_latency_ms": round(self.alpaca.last_latency_ms, 1) if self.live_mode else 0.0,
                 "trade_size": self.trade_size,
-                "profit_target": self.daily_profit_target,
-                "loss_limit": self.daily_loss_limit,
+                "profit_target": self.profit_target,
+                "loss_limit": self.loss_limit,
                 "market_status": self.market_status,
                 "market_session": self.market_session,
                 "last_bar_age_sec": round(self.last_bar_age_sec, 1),
