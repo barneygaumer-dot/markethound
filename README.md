@@ -1,4 +1,5 @@
-# <img width="525" height="78" alt="image" src="https://github.com/user-attachments/assets/bcbdbeec-2c24-43eb-8d3e-a7df966a7768" />
+# <img width="525" height="78" alt="image" src="https://github.com/user-attachments/assets/d2597d7c-8fa6-4081-8888-d158f6cb34e5" />
+
 
 
 ## License and Trading Risk
