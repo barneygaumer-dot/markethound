@@ -12,9 +12,11 @@ import random
 import re
 import threading
 import time
+import statistics
 from typing import Deque, Dict, Optional
 
 import requests
+import websocket
 
 from .evidence import EvidenceRecorder
 from .trade_log import DailyTradeLog
@@ -32,6 +34,10 @@ class Tick:
     sma5: float = 0.0
     rsi: float = 50.0
     source: str = "SIM"
+    open: float | None = None
+    high: float | None = None
+    low: float | None = None
+    close: float | None = None
 
 
 @dataclass
@@ -94,40 +100,337 @@ class AlpacaMarketData:
         return out
 
     def seed(self, symbol: str) -> dict:
+        """Bootstrap enough history to make the cockpit useful immediately.
+
+        * SMA5: five completed daily closes.
+        * RSI/chart: the five most recent completed regular sessions plus any
+          current-day extended-hours bars the selected feed actually supplies.
+        * VWAP: each historical point gets its own session VWAP, while the
+          engine later resets the accumulator to *today's current session* so
+          old volume can never bleed into a tactical VWAP.
+
+        REST is bootstrap/history only. The websocket remains authoritative for
+        new tactical data and is the only thing that can unlock fresh AI calls.
+        """
         now_et = datetime.now(NY)
-        start_daily = (now_et.date() - timedelta(days=20)).isoformat()
+        today = now_et.date()
+
+        start_daily = (today - timedelta(days=20)).isoformat()
         daily = self._get(
             f"/v2/stocks/{symbol}/bars",
             {"timeframe": "1Day", "start": start_daily, "limit": 30,
              "adjustment": "all", "feed": self.feed, "sort": "asc"},
         ).get("bars", [])
 
-        # Use five completed sessions for the 5-day SMA baseline.
-        today = now_et.date()
         completed = []
         for b in daily:
             try:
                 d = datetime.fromisoformat(b["t"].replace("Z", "+00:00")).astimezone(NY).date()
+                c = float(b["c"])
             except Exception:
                 continue
-            if d < today:
-                completed.append(float(b["c"]))
-        daily_closes = completed[-5:]
+            if d < today and c > 0:
+                completed.append((d, c))
+        daily_closes = [c for _, c in completed[-5:]]
+        completed_dates = [d for d, _ in completed[-5:]]
 
-        # Seed today's intraday minute history, including extended-hours data where feed supplies it.
-        start_et = datetime.combine(today, datetime.min.time(), NY).replace(hour=4)
-        bars = self._get(
+        # Pull a single multi-day minute window. Keep regular-session bars for
+        # the previous five completed trading days and today's bars from 04:00
+        # ET forward. That yields ~1,950 historical points + today's premarket,
+        # which fits the 2,400-point live chart buffer.
+        start_day = completed_dates[0] if completed_dates else (today - timedelta(days=10))
+        start_et = datetime.combine(start_day, datetime.min.time(), NY).replace(hour=4)
+        minute_payload = self._get(
             f"/v2/stocks/{symbol}/bars",
-            {"timeframe": "1Min", "start": start_et.isoformat(), "limit": 1000,
-             "adjustment": "raw", "feed": self.feed, "sort": "asc"},
-        ).get("bars", [])
-        return {"daily_closes": daily_closes, "minute_bars": bars}
+            {"timeframe": "1Min", "start": start_et.isoformat(), "end": now_et.isoformat(),
+             "limit": 10000, "adjustment": "raw", "feed": self.feed, "sort": "asc"},
+        )
+        raw_bars = minute_payload.get("bars", [])
+
+        regular_dates = set(completed_dates)
+        history_bars = []
+        today_bars = []
+        # Relative-volume baseline by New York minute-of-day. Keep this
+        # separate from the chart so premarket is compared with premarket and
+        # regular hours with regular hours. Median resists one-off volume spikes.
+        volume_samples: dict[int, list[int]] = {}
+        for b in raw_bars:
+            try:
+                dt_et = datetime.fromisoformat(str(b.get("t", "")).replace("Z", "+00:00")).astimezone(NY)
+            except Exception:
+                continue
+            d = dt_et.date()
+            mins = dt_et.hour * 60 + dt_et.minute
+            if d in regular_dates and 4 * 60 <= mins < 20 * 60:
+                vol = int(b.get("v", 0) or 0)
+                if vol > 0:
+                    volume_samples.setdefault(mins, []).append(vol)
+            if d in regular_dates and 9 * 60 + 30 <= mins < 16 * 60:
+                history_bars.append(b)
+            elif d == today and 4 * 60 <= mins:
+                today_bars.append(b)
+
+        volume_baseline = {
+            str(minute): float(statistics.median(values))
+            for minute, values in volume_samples.items() if values
+        }
+        return {
+            "daily_closes": daily_closes,
+            "minute_bars": history_bars + today_bars,
+            "history_bar_count": len(history_bars),
+            "today_bar_count": len(today_bars),
+            "volume_baseline": volume_baseline,
+            "volume_baseline_minutes": len(volume_baseline),
+        }
 
     def latest(self, symbol: str) -> dict:
         trade = self._get(f"/v2/stocks/{symbol}/trades/latest", {"feed": self.feed}).get("trade") or {}
         bar = self._get(f"/v2/stocks/{symbol}/bars/latest", {"feed": self.feed}).get("bar") or {}
         return {"trade": trade, "bar": bar}
 
+
+
+class AlpacaLiveStream:
+    """Real-time Alpaca stock stream with an IEX/SIP trade+bar subscription.
+
+    REST remains useful for bootstrap/history. Tactical live state is driven by
+    the websocket so MarketHound does not depend on repeatedly polling the
+    latest REST endpoints. Trades drive the current price immediately; official
+    1-minute bars drive indicators/AI. A small trade-built minute bar is kept as
+    a fallback if a streamed bar is missed.
+    """
+
+    BASE = "wss://stream.data.alpaca.markets/v2"
+
+    def __init__(self, config: Optional[dict] = None):
+        config = config or {}
+        self.key = str(config.get("alpaca_key") or os.getenv("APCA_API_KEY_ID", "")).strip()
+        self.secret = str(config.get("alpaca_secret") or os.getenv("APCA_API_SECRET_KEY", "")).strip()
+        self.feed = str(config.get("alpaca_feed") or os.getenv("ALPACA_FEED", "iex")).strip().lower() or "iex"
+        self.symbol = ""
+        self.lock = threading.RLock()
+        self.thread: Optional[threading.Thread] = None
+        self.ws = None
+        self.stop_event = threading.Event()
+        self.connected = False
+        self.authenticated = False
+        self.subscribed = False
+        self.last_error = ""
+        self.last_event_at = 0.0
+        self.last_trade = {}
+        self.completed_bars: Deque[dict] = deque(maxlen=240)
+        self.events: Deque[dict] = deque(maxlen=100)
+        self._agg = None
+        self.reconnects = 0
+
+    @property
+    def ready(self) -> bool:
+        return bool(self.key and self.secret)
+
+    @property
+    def url(self) -> str:
+        return f"{self.BASE}/{self.feed}"
+
+    @staticmethod
+    def _parse_ts(value: str) -> float:
+        value = str(value or "")
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except Exception:
+            # Alpaca can send nanosecond RFC3339 timestamps. Trim fractional
+            # precision only if the local Python parser rejects it.
+            m = re.match(r"^(.*\.\d{6})\d*(Z|[+-]\d\d:\d\d)$", value)
+            if m:
+                return datetime.fromisoformat((m.group(1)+m.group(2)).replace("Z", "+00:00")).timestamp()
+            return time.time()
+
+    @staticmethod
+    def _bar_ts(minute_epoch: int) -> str:
+        return datetime.fromtimestamp(minute_epoch, timezone.utc).isoformat().replace("+00:00", "Z")
+
+    def _record_event(self, kind: str, **extra):
+        self.events.append({"ts": time.time(), "kind": kind, **extra})
+
+    def _send(self, payload: dict):
+        ws = self.ws
+        if ws is not None:
+            ws.send(json.dumps(payload, separators=(",", ":")))
+
+    def _on_open(self, ws):
+        with self.lock:
+            self.connected = True
+            self.last_error = ""
+            self._record_event("connected", url=self.url)
+        self._send({"action":"auth","key":self.key,"secret":self.secret})
+
+    def _finalize_aggregate(self):
+        if not self._agg:
+            return
+        a = self._agg
+        v = int(a["v"])
+        bar = {
+            "T": "b", "S": self.symbol,
+            "o": a["o"], "h": a["h"], "l": a["l"], "c": a["c"],
+            "v": v, "n": int(a["n"]),
+            "vw": (a["pv"] / v) if v else a["c"],
+            "t": self._bar_ts(int(a["minute"])),
+            "fallback": True,
+        }
+        self.completed_bars.append(bar)
+
+    def _on_trade(self, msg: dict):
+        if str(msg.get("S", "")).upper() != self.symbol:
+            return
+        price = float(msg.get("p", 0) or 0)
+        size = int(msg.get("s", 0) or 0)
+        if price <= 0:
+            return
+        ts = self._parse_ts(msg.get("t", ""))
+        minute = int(ts // 60) * 60
+        self.last_trade = dict(msg)
+        self.last_event_at = time.time()
+        if self._agg is None:
+            self._agg = {"minute":minute,"o":price,"h":price,"l":price,"c":price,"v":size,"pv":price*size,"n":1}
+            return
+        if minute > self._agg["minute"]:
+            self._finalize_aggregate()
+            self._agg = {"minute":minute,"o":price,"h":price,"l":price,"c":price,"v":size,"pv":price*size,"n":1}
+        elif minute == self._agg["minute"]:
+            a=self._agg; a["h"]=max(a["h"],price); a["l"]=min(a["l"],price); a["c"]=price
+            a["v"] += size; a["pv"] += price*size; a["n"] += 1
+
+    def _on_bar(self, msg: dict):
+        if str(msg.get("S", "")).upper() != self.symbol:
+            return
+        self.last_event_at = time.time()
+        bar = dict(msg)
+        bar["fallback"] = False
+        self.completed_bars.append(bar)
+
+    def _on_message(self, ws, raw):
+        try:
+            payload = json.loads(raw)
+            messages = payload if isinstance(payload, list) else [payload]
+        except Exception as ex:
+            with self.lock:
+                self.last_error = f"stream JSON error: {ex}"
+            return
+        with self.lock:
+            for msg in messages:
+                if not isinstance(msg, dict):
+                    continue
+                kind = msg.get("T")
+                if kind == "success":
+                    text = str(msg.get("msg", ""))
+                    if text == "authenticated":
+                        self.authenticated = True
+                        self._record_event("authenticated", feed=self.feed)
+                        self._send({"action":"subscribe","trades":[self.symbol],"bars":[self.symbol]})
+                elif kind == "subscription":
+                    self.subscribed = self.symbol in (msg.get("trades") or [])
+                    self._record_event("subscribed", trades=msg.get("trades") or [], bars=msg.get("bars") or [])
+                elif kind == "t":
+                    self._on_trade(msg)
+                elif kind == "b":
+                    self._on_bar(msg)
+                elif kind == "error":
+                    self.last_error = str(msg.get("msg", msg))
+                    self._record_event("error", message=self.last_error, code=msg.get("code"))
+
+    def _on_error(self, ws, error):
+        with self.lock:
+            self.last_error = str(error)
+            self._record_event("socket_error", message=self.last_error)
+
+    def _on_close(self, ws, code, reason):
+        with self.lock:
+            self.connected = False; self.authenticated = False; self.subscribed = False
+            self._record_event("closed", code=code, reason=str(reason or ""))
+
+    def _run(self):
+        first = True
+        while not self.stop_event.is_set():
+            if not first:
+                self.reconnects += 1
+                time.sleep(2.0)
+            first = False
+            if self.stop_event.is_set():
+                break
+            try:
+                ws = websocket.WebSocketApp(
+                    self.url,
+                    on_open=self._on_open, on_message=self._on_message,
+                    on_error=self._on_error, on_close=self._on_close,
+                )
+                with self.lock: self.ws = ws
+                ws.run_forever(ping_interval=20, ping_timeout=10)
+            except Exception as ex:
+                with self.lock:
+                    self.last_error = str(ex)
+                    self._record_event("run_error", message=self.last_error)
+            finally:
+                with self.lock:
+                    self.ws = None; self.connected = False; self.authenticated = False; self.subscribed = False
+
+    def start(self, symbol: str):
+        if not self.ready:
+            raise RuntimeError("Alpaca stream credentials are not configured.")
+        self.stop()
+        with self.lock:
+            self.symbol = str(symbol or "").upper().strip()
+            self.last_trade = {}; self.completed_bars.clear(); self.events.clear(); self._agg = None
+            self.last_error = ""; self.last_event_at = 0.0; self.reconnects = 0
+            self.stop_event = threading.Event()
+            self.thread = threading.Thread(target=self._run, daemon=True, name=f"mh-alpaca-{self.symbol}")
+            self.thread.start()
+
+    def stop(self):
+        self.stop_event.set()
+        ws = self.ws
+        if ws is not None:
+            try: ws.close()
+            except Exception: pass
+        t = self.thread
+        if t and t.is_alive() and t is not threading.current_thread():
+            t.join(timeout=1.5)
+        with self.lock:
+            self.connected = False; self.authenticated = False; self.subscribed = False
+            self.ws = None; self.thread = None
+
+    def drain_bars(self) -> list[dict]:
+        with self.lock:
+            out = list(self.completed_bars)
+            self.completed_bars.clear()
+            return out
+
+    def drain_events(self) -> list[dict]:
+        with self.lock:
+            out = list(self.events)
+            self.events.clear()
+            return out
+
+    def snapshot(self) -> dict:
+        with self.lock:
+            current_bar = {}
+            if self._agg:
+                a = self._agg
+                v = int(a.get("v", 0) or 0)
+                current_bar = {
+                    "t": self._bar_ts(int(a["minute"])),
+                    "o": float(a["o"]), "h": float(a["h"]),
+                    "l": float(a["l"]), "c": float(a["c"]),
+                    "v": v, "n": int(a.get("n", 0) or 0),
+                    "vw": (float(a.get("pv", 0.0)) / v) if v else float(a["c"]),
+                    "forming": True,
+                }
+            return {
+                "connected": self.connected, "authenticated": self.authenticated, "subscribed": self.subscribed,
+                "feed": self.feed, "symbol": self.symbol, "url": self.url,
+                "last_error": self.last_error, "last_event_at": self.last_event_at,
+                "event_age_sec": round(max(0.0, time.time()-self.last_event_at),2) if self.last_event_at else None,
+                "reconnects": self.reconnects, "last_trade": dict(self.last_trade),
+                "current_bar": current_bar,
+            }
 
 
 class AlpacaTradingClient:
@@ -301,6 +604,8 @@ class MarketHoundEngine:
         self.closes: Deque[float] = deque(maxlen=1000)
         self.daily_closes: Deque[float] = deque([338.0, 341.5, 345.2, 348.1, 350.0], maxlen=20)
         self.minute_volumes: Deque[int] = deque(maxlen=120)
+        self.volume_baseline: dict[int, float] = {}
+        self.last_volume_telemetry: dict = {}
         self.position = "FLAT"
         self.qty = 0.0
         self.entry_price = 0.0
@@ -322,6 +627,7 @@ class MarketHoundEngine:
         self.indicator_source = "SIMULATOR"
         self.last_bar_age_sec = 0.0
         self.alpaca = AlpacaMarketData(app_config)
+        self.stream = AlpacaLiveStream(app_config)
         self.broker = AlpacaTradingClient(app_config)
         self.ai = OpenAIDecisionEngine(app_config)
         self.live_execution_available = bool(app_config.get("live_execution_enabled", False))
@@ -344,6 +650,8 @@ class MarketHoundEngine:
             if self.running:
                 raise RuntimeError("Stop MarketHound before changing application settings.")
             self.alpaca = AlpacaMarketData(app_config)
+            self.stream.stop()
+            self.stream = AlpacaLiveStream(app_config)
             self.broker = AlpacaTradingClient(app_config)
             self.ai = OpenAIDecisionEngine(app_config)
             self.live_execution_available = bool(app_config.get("live_execution_enabled", False))
@@ -361,9 +669,9 @@ class MarketHoundEngine:
             self.market_status = f"ALPACA {self.alpaca.feed.upper()}" if self.live_mode else "SIMULATOR"
             self.market_session = self._session_label() if self.live_mode else "SIMULATOR"
             self.ai_status = f"OPENAI {self.ai.model}" if self.live_mode else "RULE ENGINE"
-            self.data_source = f"ALPACA {self.alpaca.feed.upper()} 1MIN BARS" if self.live_mode else "SIMULATOR"
-            self.price_source = f"ALPACA {self.alpaca.feed.upper()} LATEST TRADE" if self.live_mode else "SIMULATOR"
-            self.indicator_source = f"ALPACA {self.alpaca.feed.upper()} 1MIN BARS" if self.live_mode else "SIMULATOR"
+            self.data_source = f"ALPACA {self.alpaca.feed.upper()} LIVE STREAM BARS" if self.live_mode else "SIMULATOR"
+            self.price_source = f"ALPACA {self.alpaca.feed.upper()} LIVE STREAM TRADE" if self.live_mode else "SIMULATOR"
+            self.indicator_source = f"ALPACA {self.alpaca.feed.upper()} LIVE STREAM BARS" if self.live_mode else "SIMULATOR"
 
     def _reset_market_state(self):
         self.ticks.clear(); self.closes.clear(); self.minute_volumes.clear()
@@ -476,9 +784,9 @@ class MarketHoundEngine:
                 self.market_status = f"ALPACA {self.alpaca.feed.upper()}"
                 self.market_session = self._session_label()
                 self.ai_status = f"OPENAI {self.ai.model}"
-                self.data_source = f"ALPACA {self.alpaca.feed.upper()} 1MIN BARS"
-                self.price_source = f"ALPACA {self.alpaca.feed.upper()} LATEST TRADE"
-                self.indicator_source = f"ALPACA {self.alpaca.feed.upper()} 1MIN BARS"
+                self.data_source = f"ALPACA {self.alpaca.feed.upper()} LIVE STREAM BARS"
+                self.price_source = f"ALPACA {self.alpaca.feed.upper()} LIVE STREAM TRADE"
+                self.indicator_source = f"ALPACA {self.alpaca.feed.upper()} LIVE STREAM BARS"
             else:
                 self.market_status = "SIMULATOR"; self.market_session = "SIMULATOR"; self.ai_status = "RULE ENGINE"
                 self.data_source = "SIMULATOR"; self.price_source = "SIMULATOR"; self.indicator_source = "SIMULATOR"
@@ -490,6 +798,7 @@ class MarketHoundEngine:
             if self.running: return
             if self.live_mode:
                 self._seed_live()
+                self.stream.start(self.ticker)
             if self.execution_mode == "LIVE":
                 self._sync_broker(force=True)
                 if not self.broker_account:
@@ -500,6 +809,7 @@ class MarketHoundEngine:
                     "market": self.market_status, "ai": self.ai_status, "trade_size": self.trade_size,
                     "daily_profit_target": self.daily_profit_target, "daily_loss_limit": self.daily_loss_limit,
                     "ai_interval_sec": self.ai_interval, "market_poll_sec": self.live_poll_interval,
+                    "market_stream": f"{self.stream.BASE}/{self.alpaca.feed}",
                 })
                 self.evidence.write("initial_state", self._evidence_state())
             self.running = True
@@ -508,11 +818,38 @@ class MarketHoundEngine:
             self.thread.start()
 
     def stop(self):
+        """Orderly human stop: prevent new entries, flatten, then disarm."""
         with self.lock:
             self.running = False
+            if self.position != "FLAT":
+                self.evidence.write("human_stop_requested", {"state_before": self._evidence_state()})
+                self._flatten("Human STOP requested; flattening position before disarm.", "HUMAN")
+            else:
+                self.evidence.write("human_stop_requested", {"state_before": self._evidence_state(), "already_flat": True})
+            flat = self.position == "FLAT"
             if self.evidence.enabled:
+                self.evidence.write("human_stop_result", {"flat": flat, "state_after": self._evidence_state()})
                 self.evidence.write("final_state", self._evidence_state())
-                self.evidence.close("manual_stop")
+                self.evidence.close("manual_stop" if flat else "manual_stop_flatten_failed")
+        self.stream.stop()
+        if not flat:
+            raise RuntimeError("STOP FAILED — POSITION STILL OPEN")
+
+    def flatten_now(self):
+        """Immediate human flatten override. Always disarms after the request."""
+        with self.lock:
+            self.running = False
+            before = self._evidence_state()
+            self.evidence.write("human_flatten_requested", {"state_before": before})
+            if self.position != "FLAT":
+                self._flatten("Human FLATTEN NOW requested.", "HUMAN")
+            flat = self.position == "FLAT"
+            after = self._evidence_state()
+            self.evidence.write("human_flatten_result", {"flat": flat, "state_after": after})
+        self.stream.stop()
+        if not flat:
+            raise RuntimeError("FLATTEN FAILED — POSITION STILL OPEN")
+        return after
 
     def _seed_live(self):
         seed = self.alpaca.seed(self.ticker)
@@ -522,11 +859,25 @@ class MarketHoundEngine:
             # completed closes plus the current live/minute price.
             self.daily_closes = deque(daily[-5:], maxlen=20)
 
+        self.volume_baseline = {
+            int(k): float(v) for k, v in (seed.get("volume_baseline") or {}).items()
+            if float(v or 0) > 0
+        }
+        self.last_volume_telemetry = {}
         self._reset_market_state()
+        now_et = datetime.now(NY)
+        today = now_et.date()
+        current_session = self._session_label(now_et)
+        current_pv = 0.0
+        current_vol = 0
+        current_bucket = f"{today.isoformat()}:{current_session}"
+
         for b in seed.get("minute_bars") or []:
             ts_str = str(b.get("t", ""))
             try:
-                ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).timestamp()
+                dt = datetime.fromisoformat(ts_str.replace("Z", "+00:00"))
+                ts = dt.timestamp()
+                dt_et = dt.astimezone(NY)
             except Exception:
                 continue
             close = float(b.get("c", 0) or 0)
@@ -547,18 +898,35 @@ class MarketHoundEngine:
                 vwap=round(self._vwap(), 6),
                 sma5=round(self._live_sma5_for_price(close), 6),
                 rsi=round(self._rsi(), 4),
-                source=f"ALPACA {self.alpaca.feed.upper()} 1MIN",
+                source=f"ALPACA {self.alpaca.feed.upper()} REST BOOTSTRAP 1MIN",
+                open=float(b.get("o", close) or close),
+                high=float(b.get("h", close) or close),
+                low=float(b.get("l", close) or close),
+                close=close,
             )
             self.ticks.append(tick)
             self.last_price = close
             self.last_bar_ts = ts_str
+
+            # Preserve only today's *current-session* volume in the live VWAP
+            # accumulator. Historical sessions exist for chart/RSI context but
+            # are never allowed to contaminate today's tactical VWAP.
+            if dt_et.date() == today and self._session_label(dt_et) == current_session:
+                current_pv += bar_vwap * vol
+                current_vol += vol
+
+        # Switch the active VWAP accumulator from historical chart-building to
+        # today's current session before the websocket takes over.
+        self._vwap_bucket = current_bucket
+        self.cumulative_pv = current_pv
+        self.cumulative_volume = current_vol
 
         latest = self.alpaca.latest(self.ticker)
         latest_trade = latest.get("trade") or {}
         price = float(latest_trade.get("p", 0) or 0)
         if price > 0:
             # Tile/P&L use latest trade; chart/indicators remain one consistent
-            # Alpaca 1-minute bar series.
+            # minute-bar series until the stream supplies fresh events.
             self.last_price = price
         elif not self.ticks:
             raise RuntimeError(f"No live market data returned for {self.ticker}.")
@@ -590,82 +958,116 @@ class MarketHoundEngine:
     def _generate_tick(self):
         with self.lock:
             trend = math.sin(time.time()/25.0) * 0.0007; shock = random.gauss(0, 0.00135)
-            new_price = max(1.0, self.last_price * (1 + trend + shock)); vol = int(max(100, random.lognormvariate(8.0, 0.65)))
+            prior_price = self.last_price
+            new_price = max(1.0, prior_price * (1 + trend + shock)); vol = int(max(100, random.lognormvariate(8.0, 0.65)))
             ts = time.time()
             self.last_price = round(new_price, 2)
+            wick = max(0.01, abs(self.last_price-prior_price) * 0.35)
+            sim_open = round(prior_price, 2)
+            sim_high = round(max(sim_open, self.last_price) + random.random()*wick, 2)
+            sim_low = round(max(0.01, min(sim_open, self.last_price) - random.random()*wick), 2)
             self._reset_vwap_if_needed(ts)
             self.cumulative_pv += self.last_price * vol; self.cumulative_volume += vol
             self.closes.append(self.last_price); self.minute_volumes.append(vol)
-            tick = Tick(ts, self.last_price, vol, round(self._vwap(), 6), round(self._live_sma5_for_price(self.last_price), 6), round(self._rsi(), 4), "SIMULATOR")
+            tick = Tick(ts, self.last_price, vol, round(self._vwap(), 6), round(self._live_sma5_for_price(self.last_price), 6), round(self._rsi(), 4), "SIMULATOR", sim_open, sim_high, sim_low, self.last_price)
             self.ticks.append(tick)
             self._update_pnl()
             self.evidence.write("market_snapshot", {"source": "SIMULATOR", "tick": asdict(tick), "state": self._evidence_state()})
             self._maybe_decide_rules()
 
     def _live_tick(self):
-        latest = self.alpaca.latest(self.ticker)
-        trade = latest.get("trade") or {}
-        bar = latest.get("bar") or {}
-        trade_price = float(trade.get("p", 0) or 0)
-        bar_close = float(bar.get("c", 0) or 0)
-        price = trade_price or bar_close
-        if price <= 0:
-            raise RuntimeError("Latest market response did not contain a usable price.")
+        stream_state = self.stream.snapshot()
+        trade = stream_state.get("last_trade") or {}
+        bars = self.stream.drain_bars()
 
         with self.lock:
-            # Current price/P&L comes from the latest Alpaca trade when available.
-            self.last_price = price
-            self._update_pnl()
+            trade_price = float(trade.get("p", 0) or 0)
+            if trade_price > 0:
+                # Current price/P&L is driven immediately by the real-time stream.
+                self.last_price = trade_price
+                self._update_pnl()
 
-            bar_ts = str(bar.get("t", ""))
-            new_bar = bool(bar_ts and bar_ts != self.last_bar_ts)
-            if new_bar:
+                # Deterministic ROE must not wait for a completed minute bar or
+                # the next AI evaluation. Enforce daily boundaries immediately
+                # when the live trade stream moves realized + unrealized P&L
+                # through either mission limit.
+                if self._check_daily_limits():
+                    self.evidence.write("daily_limit_enforced_realtime", {
+                        "trade_price": round(self.last_price, 6),
+                        "state_after": self._evidence_state(),
+                    })
+                    return
+
+            # Multiple bars can arrive between engine polls. Apply them in time
+            # order and evaluate AI once on the newest unseen minute. Official
+            # Alpaca bars and trade-built fallback bars share the same timestamp,
+            # so last_bar_ts naturally deduplicates them.
+            newest_bar = None
+            for bar in sorted(bars, key=lambda b: str(b.get("t", ""))):
+                bar_ts = str(bar.get("t", ""))
+                if not bar_ts or bar_ts == self.last_bar_ts:
+                    continue
                 try:
                     ts = datetime.fromisoformat(bar_ts.replace("Z", "+00:00")).timestamp()
                 except Exception:
                     ts = time.time()
                 vol = int(bar.get("v", 0) or 0)
-                close = float(bar.get("c", price) or price)
+                close = float(bar.get("c", self.last_price) or self.last_price)
+                if close <= 0:
+                    continue
                 bar_vwap = float(bar.get("vw", close) or close)
-
                 self._reset_vwap_if_needed(ts)
                 self.cumulative_pv += bar_vwap * vol
                 self.cumulative_volume += vol
                 self.closes.append(close)
                 self.minute_volumes.append(vol)
                 point = Tick(
-                    ts=ts,
-                    price=close,
-                    volume=vol,
+                    ts=ts, price=close, volume=vol,
                     vwap=round(self._vwap(), 6),
                     sma5=round(self._live_sma5_for_price(close), 6),
                     rsi=round(self._rsi(), 4),
-                    source=f"ALPACA {self.alpaca.feed.upper()} 1MIN",
+                    source=f"ALPACA {self.alpaca.feed.upper()} STREAM 1MIN",
+                    open=float(bar.get("o", close) or close),
+                    high=float(bar.get("h", close) or close),
+                    low=float(bar.get("l", close) or close),
+                    close=close,
                 )
                 self.ticks.append(point)
                 self.last_bar_ts = bar_ts
+                newest_bar = bar
 
             self._refresh_market_session()
             if self.execution_mode == "LIVE": self._sync_broker()
             self.evidence.write("market_snapshot", {
-                "source": f"ALPACA {self.alpaca.feed.upper()}",
+                "source": f"ALPACA {self.alpaca.feed.upper()} STREAM",
                 "provenance": {
                     "current_price": self.price_source,
                     "chart_bars": self.data_source,
                     "indicators": self.indicator_source,
                     "market_session": self.market_session,
-                    "new_minute_bar": new_bar,
+                    "new_minute_bar": bool(newest_bar),
                 },
-                "raw": {"trade": trade, "bar": bar},
+                "raw": {"trade": trade, "newest_bar": newest_bar},
+                "stream": {k:v for k,v in stream_state.items() if k != "last_trade"},
+                "stream_events": self.stream.drain_events(),
                 "alpaca_requests": self.alpaca.drain_request_events(),
+                "volume_telemetry": dict(self.last_volume_telemetry),
                 "state": self._evidence_state(),
             })
 
-            # Tactical AI only evaluates when a new real market bar exists.
-            # Closed/stale sessions therefore do not burn tokens re-reading
-            # the same last bar.
-            if new_bar:
-                self._maybe_decide_ai()
+            # Tactical AI evaluates only on a newly completed AND fresh minute.
+            # A delayed/sparse bar may update the cockpit for evidence, but it
+            # never receives tactical launch authority.
+            if newest_bar:
+                if "STALE DATA" in self.market_session:
+                    self.evidence.write("ai_suppressed", {
+                        "reason": "stale_market_bar",
+                        "bar_age_sec": round(self.last_bar_age_sec, 2),
+                        "last_bar_ts": self.last_bar_ts,
+                        "volume_telemetry": dict(self.last_volume_telemetry),
+                    })
+                else:
+                    self._maybe_decide_ai()
 
     def _vwap(self) -> float:
         return self.cumulative_pv / self.cumulative_volume if self.cumulative_volume else self.last_price
@@ -684,9 +1086,33 @@ class MarketHoundEngine:
         rs=avg_gain/avg_loss; return 100-(100/(1+rs))
 
     def _volume_ratio(self) -> float:
-        vols=list(self.minute_volumes)[-30:]
-        if len(vols)<6: return 1.0
-        avg=sum(vols[:-1])/max(1,len(vols)-1); return vols[-1]/avg if avg else 1.0
+        if not self.minute_volumes:
+            self.last_volume_telemetry = {"bar_volume": 0, "baseline_volume": 0.0, "ratio": 1.0, "method": "no-volume"}
+            return 1.0
+        current = int(self.minute_volumes[-1])
+        minute = None
+        if self.last_bar_ts:
+            try:
+                dt_et = datetime.fromisoformat(self.last_bar_ts.replace("Z", "+00:00")).astimezone(NY)
+                minute = dt_et.hour * 60 + dt_et.minute
+            except Exception:
+                minute = None
+        baseline = float(self.volume_baseline.get(minute, 0.0)) if minute is not None else 0.0
+        method = "historical-same-minute-median"
+        if baseline <= 0:
+            # Fallback only to recent bars from the same active session; never
+            # compare thin premarket flow with regular-session volume.
+            active_bucket = self._session_bucket_for_ts(time.time())
+            same_session = [int(t.volume) for t in self.ticks if self._session_bucket_for_ts(t.ts) == active_bucket and int(t.volume) > 0]
+            prior = same_session[-31:-1] if len(same_session) > 1 else []
+            baseline = (sum(prior) / len(prior)) if prior else 0.0
+            method = "same-session-recent-average" if baseline > 0 else "baseline-unavailable"
+        ratio = (current / baseline) if baseline > 0 else 1.0
+        self.last_volume_telemetry = {
+            "bar_volume": current, "baseline_volume": round(baseline, 4),
+            "ratio": round(ratio, 6), "method": method, "minute_et": minute,
+        }
+        return ratio
 
 
     def _sync_broker(self, force: bool = False):
@@ -900,7 +1326,7 @@ class MarketHoundEngine:
             "ticker": self.ticker, "running": self.running, "live_mode": self.live_mode, "execution_mode": self.execution_mode,
             "price": round(self.last_price, 6), "vwap": round(self._vwap(), 6),
             "sma5": round(self._sma5(), 6), "rsi": round(self._rsi(), 4),
-            "volume_ratio": round(self._volume_ratio(), 6), "position": self.position,
+            "volume_ratio": round(self._volume_ratio(), 6), "volume_telemetry": dict(self.last_volume_telemetry), "position": self.position,
             "qty": round(self.qty, 8), "entry_price": round(self.entry_price, 6),
             "realized_pnl": round(self.realized_pnl, 6), "unrealized_pnl": round(self.unrealized_pnl, 6),
             "total_pnl": round(self.realized_pnl + self.unrealized_pnl, 6),
@@ -919,7 +1345,7 @@ class MarketHoundEngine:
         return {
             "ticker":self.ticker,"position":self.position,"execution_mode":self.execution_mode,"price":round(self.last_price,4),
             "vwap":round(self._vwap(),4),"sma5":round(self._sma5(),4),"rsi":round(self._rsi(),2),
-            "volume_ratio":round(self._volume_ratio(),3),"trade_size":self.trade_size,
+            "volume_ratio":round(self._volume_ratio(),3),"volume_telemetry":dict(self.last_volume_telemetry),"trade_size":self.trade_size,
             "daily_realized_pnl":round(self.realized_pnl,2),"daily_unrealized_pnl":round(self.unrealized_pnl,2),
             "daily_profit_target":self.daily_profit_target,"daily_loss_limit":self.daily_loss_limit,
             "market_session":self.market_session,"last_bar_ts":self.last_bar_ts,
@@ -982,8 +1408,25 @@ class MarketHoundEngine:
     def snapshot(self) -> Dict:
         with self.lock:
             self._refresh_market_session()
-            points = list(self.ticks)[-240:]
+            points = list(self.ticks)[-2400:] if self.live_mode else list(self.ticks)[-240:]
             decisions = list(self.decisions)[-40:]
+            stream_snapshot = self.stream.snapshot() if self.live_mode else {}
+            current_bar = dict(stream_snapshot.get("current_bar") or {})
+            live_candle = {}
+            if current_bar:
+                try:
+                    live_candle = {
+                        "ts": int(datetime.fromisoformat(str(current_bar.get("t", "")).replace("Z", "+00:00")).timestamp() * 1000),
+                        "open": round(float(current_bar.get("o", self.last_price) or self.last_price), 6),
+                        "high": round(float(current_bar.get("h", self.last_price) or self.last_price), 6),
+                        "low": round(float(current_bar.get("l", self.last_price) or self.last_price), 6),
+                        "close": round(float(current_bar.get("c", self.last_price) or self.last_price), 6),
+                        "volume": int(current_bar.get("v", 0) or 0),
+                        "forming": True,
+                        "source": f"ALPACA {self.alpaca.feed.upper()} STREAM TRADES",
+                    }
+                except Exception:
+                    live_candle = {}
             return {
                 "ticker": self.ticker,
                 "running": self.running,
@@ -1032,6 +1475,8 @@ class MarketHoundEngine:
                 "last_bar_ts": self.last_bar_ts,
                 "session_started_at": self.session_started_at,
                 "alpaca_feed": self.alpaca.feed,
+                "market_stream": {k:v for k,v in stream_snapshot.items() if k not in ("last_trade", "current_bar")},
+                "live_candle": live_candle,
                 "ai_model": self.ai.model,
                 "last_ai_meta": {
                     "response_id": self.last_ai_meta.get("response_id", ""),
@@ -1050,6 +1495,10 @@ class MarketHoundEngine:
                     {
                         "ts": int(t.ts * 1000),
                         "price": round(t.price, 6),
+                        "open": round(t.open if t.open is not None else t.price, 6),
+                        "high": round(t.high if t.high is not None else t.price, 6),
+                        "low": round(t.low if t.low is not None else t.price, 6),
+                        "close": round(t.close if t.close is not None else t.price, 6),
                         "volume": int(t.volume),
                         "vwap": round(t.vwap or self._vwap(), 6),
                         "sma5": round(t.sma5 or self._live_sma5_for_price(t.price), 6),

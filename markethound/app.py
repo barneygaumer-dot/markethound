@@ -10,7 +10,7 @@ from .engine import MarketHoundEngine
 from .updater import AppUpdater, UpdateError
 
 APP_ROOT = Path(__file__).resolve().parents[1]
-VERSION = "1.2-hf14"
+VERSION = "1.2-hf26"
 config_store = AppConfig()
 engine = MarketHoundEngine(config_store.values)
 updater = AppUpdater(APP_ROOT)
@@ -48,7 +48,19 @@ def create_app():
 
     @app.post('/api/stop')
     def stop():
-        engine.stop(); return jsonify({'ok':True})
+        try:
+            engine.stop()
+            return jsonify({'ok':True, 'flat': engine.position == 'FLAT'})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e), 'flat': engine.position == 'FLAT'}), 409
+
+    @app.post('/api/flatten')
+    def flatten():
+        try:
+            state = engine.flatten_now()
+            return jsonify({'ok':True, 'flat': True, 'state': state})
+        except Exception as e:
+            return jsonify({'ok':False,'error':str(e), 'flat': engine.position == 'FLAT'}), 409
 
 
     @app.get('/api/debug/status')
