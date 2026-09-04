@@ -27,3 +27,6 @@ reports/
 .venv/
 __pycache__/
 *.pyc
+
+# Luna local institutional memory
+data/memory/

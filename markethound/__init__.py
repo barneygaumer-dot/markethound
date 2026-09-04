@@ -1,1 +1,1 @@
-__version__ = "1.2-hf44"
+__version__ = "1.2-hf52"

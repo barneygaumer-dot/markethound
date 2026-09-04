@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass, asdict, field
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -53,6 +53,7 @@ class Decision:
     volume_ratio: float
     source: str = "RULES"
     invalidation: str = ""
+    links: list[dict] = field(default_factory=list)
 
 
 class AlpacaMarketData:
@@ -93,6 +94,35 @@ class AlpacaMarketData:
         self.last_latency_ms = elapsed_ms
         r.raise_for_status()
         return r.json()
+
+    def news(self, symbol: str, lookback_hours: int = 48, limit: int = 20) -> list[dict]:
+        """Fetch recent ticker news for ARM-time intelligence. Read-only market-data call."""
+        end = datetime.now(timezone.utc)
+        start = end - timedelta(hours=max(1, int(lookback_hours)))
+        payload = self._get("/v1beta1/news", {
+            "symbols": str(symbol or "").upper().strip(),
+            "start": start.isoformat().replace("+00:00", "Z"),
+            "end": end.isoformat().replace("+00:00", "Z"),
+            "limit": max(1, min(50, int(limit))),
+            "sort": "desc",
+        })
+        rows = payload.get("news", []) if isinstance(payload, dict) else []
+        out=[]; seen=set()
+        for row in rows:
+            if not isinstance(row, dict): continue
+            headline = str(row.get("headline") or "").strip()
+            key = re.sub(r"[^a-z0-9]+", " ", headline.lower()).strip()[:140]
+            if not headline or key in seen: continue
+            seen.add(key)
+            url = str(row.get("url") or "").strip()
+            if not url.lower().startswith("https://"): url = ""
+            out.append({
+                "id": row.get("id"), "headline": headline[:300],
+                "summary": str(row.get("summary") or "")[:700],
+                "source": str(row.get("source") or row.get("author") or "Alpaca News")[:80],
+                "created_at": str(row.get("created_at") or ""), "url": url,
+            })
+        return out[:max(1, min(20, int(limit)))]
 
     def drain_request_events(self) -> list[dict]:
         out = list(self.request_events)
@@ -434,15 +464,23 @@ class AlpacaLiveStream:
 
 
 class AlpacaTradingClient:
-    """Alpaca direct-user LIVE Trading API client."""
-    BASE = "https://api.alpaca.markets"
+    """Alpaca Trading API client for PAPER or LIVE brokerage execution."""
 
-    def __init__(self, config: Optional[dict] = None):
+    def __init__(self, config: Optional[dict] = None, paper: bool = False):
         config = config or {}
-        self.key = str(config.get("alpaca_live_key") or os.getenv("APCA_LIVE_API_KEY_ID", "")).strip()
-        self.secret = str(config.get("alpaca_live_secret") or os.getenv("APCA_LIVE_API_SECRET_KEY", "")).strip()
-        self.label = str(config.get("alpaca_account_label") or "ALPACA LIVE").strip() or "ALPACA LIVE"
-        self.enabled = bool(config.get("live_execution_enabled", False))
+        self.paper = bool(paper)
+        if self.paper:
+            self.BASE = "https://paper-api.alpaca.markets"
+            self.key = str(config.get("alpaca_key") or os.getenv("APCA_API_KEY_ID", "")).strip()
+            self.secret = str(config.get("alpaca_secret") or os.getenv("APCA_API_SECRET_KEY", "")).strip()
+            self.label = "ALPACA PAPER"
+            self.enabled = True
+        else:
+            self.BASE = "https://api.alpaca.markets"
+            self.key = str(config.get("alpaca_live_key") or os.getenv("APCA_LIVE_API_KEY_ID", "")).strip()
+            self.secret = str(config.get("alpaca_live_secret") or os.getenv("APCA_LIVE_API_SECRET_KEY", "")).strip()
+            self.label = str(config.get("alpaca_account_label") or "ALPACA LIVE").strip() or "ALPACA LIVE"
+            self.enabled = bool(config.get("live_execution_enabled", False))
         self.session = requests.Session()
         self.request_events: Deque[dict] = deque(maxlen=100)
         self.last_latency_ms = 0.0
@@ -459,19 +497,32 @@ class AlpacaTradingClient:
 
     def _request(self, method: str, path: str, **kwargs):
         if not self.ready:
-            raise RuntimeError("Alpaca LIVE trading credentials are not configured.")
+            mode = "PAPER" if self.paper else "LIVE"
+            raise RuntimeError(f"Alpaca {mode} trading credentials are not configured.")
         started = time.perf_counter()
         r = self.session.request(method, self.BASE + path, timeout=10, **kwargs)
         elapsed_ms = round((time.perf_counter() - started) * 1000, 2)
         self.last_latency_ms = elapsed_ms
-        self.request_events.append({
+        event = {
             "ts": time.time(), "method": method, "path": path,
             "status_code": r.status_code, "request_id": r.headers.get("X-Request-ID", ""),
-            "elapsed_ms": elapsed_ms,
-        })
+            "elapsed_ms": elapsed_ms, "broker_mode": "PAPER" if self.paper else "LIVE",
+        }
+        # Preserve sanitized order payload + Alpaca rejection body for QA.
+        # Trading credentials live in headers and are never recorded here.
+        if "json" in kwargs and isinstance(kwargs.get("json"), dict):
+            event["request_json"] = dict(kwargs["json"])
+        if r.status_code >= 400:
+            try:
+                event["response_json"] = r.json()
+            except Exception:
+                event["response_text"] = (r.text or "")[:2000]
+        self.request_events.append(event)
         if r.status_code == 404 and path.startswith("/v2/positions/"):
             return None
-        r.raise_for_status()
+        if r.status_code >= 400:
+            detail = event.get("response_json") or event.get("response_text") or ""
+            raise RuntimeError(f"Alpaca {'PAPER' if self.paper else 'LIVE'} HTTP {r.status_code}: {detail}")
         return r.json() if r.content else {}
 
     def account(self) -> dict:
@@ -480,6 +531,9 @@ class AlpacaTradingClient:
     def position(self, symbol: str) -> Optional[dict]:
         return self._request("GET", f"/v2/positions/{symbol}") or None
 
+    def order(self, order_id: str) -> dict:
+        return self._request("GET", f"/v2/orders/{order_id}") or {}
+
     def submit_market_order(self, symbol: str, side: str, qty: float) -> dict:
         payload = {
             "symbol": symbol,
@@ -487,7 +541,7 @@ class AlpacaTradingClient:
             "side": side,
             "type": "market",
             "time_in_force": "day",
-            "client_order_id": f"mh-{int(time.time())}-{symbol.lower()}",
+            "client_order_id": f"mh-{int(time.time()*1000)}-{symbol.lower()}",
         }
         return self._request("POST", "/v2/orders", json=payload) or {}
 
@@ -495,9 +549,104 @@ class AlpacaTradingClient:
         return self._request("DELETE", f"/v2/positions/{symbol}") or {}
 
     def drain_request_events(self) -> list[dict]:
+        """Return and clear sanitized Trading API request telemetry.
+
+        MarketHound evidence paths call this after broker sync/order operations.
+        Keep this interface symmetric with AlpacaMarketData so diagnostics can
+        never break the trading/AI loop merely because telemetry is enabled.
+        """
         out = list(self.request_events)
         self.request_events.clear()
         return out
+
+    def wait_for_fill(self, order: dict, timeout_sec: float = 5.0) -> dict:
+        order_id = str((order or {}).get("id", ""))
+        if not order_id:
+            return order or {}
+        deadline = time.time() + max(0.5, timeout_sec)
+        latest = dict(order)
+        while time.time() < deadline:
+            latest = self.order(order_id)
+            if str(latest.get("status", "")).lower() in {"filled", "canceled", "rejected", "expired"}:
+                return latest
+            time.sleep(0.20)
+        return latest
+
+
+class LocalLessonMemory:
+    """Durable, local, evidence-backed institutional memory for Luna.
+
+    Promoted lessons are injected into future AI state. Trade debriefs first land
+    as candidates; repeated corroboration is required before a new lesson is
+    promoted automatically. Files are runtime state under data/memory and are
+    intentionally excluded from Git.
+    """
+    PROMOTE_AFTER = 3
+    MIN_AVG_CONFIDENCE = 75.0
+
+    SEED_LESSONS = [
+        ("reference_levels_are_context", "Reference levels such as VWAP and SMA5 are context, not standalone signals; price structure and behavior around them determine regime.", ["structure","vwap","sma5","regime"]),
+        ("contested_vwap_reduces_authority", "Repeated two-way VWAP crossings reduce VWAP's directional authority until price establishes sustained acceptance or a confirmed break.", ["vwap","balance","regime"]),
+        ("shorts_require_bearish_structure", "Price below VWAP alone is not enough to short; require demonstrated bearish structure and confirmation.", ["short","structure","vwap"]),
+        ("mfe_giveback_is_evidence", "MFE and giveback trigger re-examination, not a mechanical exit; require persistent, confluent momentum deterioration.", ["mfe","momentum","exit"]),
+    ]
+
+    def __init__(self, root: Path):
+        self.root = Path(root)
+        self.root.mkdir(parents=True, exist_ok=True)
+        self.lessons_path = self.root / "lessons.jsonl"
+        self.candidates_path = self.root / "candidates.jsonl"
+        self._lock = threading.RLock()
+        self._seed_if_needed()
+
+    def _append(self, path: Path, obj: dict):
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n")
+
+    def _read(self, path: Path) -> list[dict]:
+        if not path.exists(): return []
+        out=[]
+        try:
+            for line in path.read_text(encoding="utf-8").splitlines():
+                try: out.append(json.loads(line))
+                except Exception: pass
+        except Exception: pass
+        return out
+
+    def _seed_if_needed(self):
+        if self.lessons_path.exists() and self.lessons_path.stat().st_size > 0: return
+        now=time.time()
+        for key,text,tags in self.SEED_LESSONS:
+            self._append(self.lessons_path,{"ts":now,"lesson_key":key,"lesson":text,"tags":tags,"status":"PROMOTED","source":"WOLFPACK_DOCTRINE","corroborations":999,"avg_confidence":100.0})
+
+    def promoted(self, state: Optional[dict]=None, limit: int=8) -> list[dict]:
+        rows=[r for r in self._read(self.lessons_path) if r.get("status")=="PROMOTED"]
+        # Keep retrieval deterministic and inspectable. Prefer tag/token overlap
+        # with current regime telemetry, then newest learned lessons.
+        hay=json.dumps(state or {}, separators=(",",":")).lower()
+        def score(r):
+            tags=[str(x).lower() for x in r.get("tags",[])]
+            return (sum(1 for t in tags if t and t in hay), float(r.get("ts",0)))
+        rows.sort(key=score, reverse=True)
+        return [{k:r.get(k) for k in ("lesson_key","lesson","tags","source","corroborations","avg_confidence")} for r in rows[:limit]]
+
+    def add_candidate(self, candidate: dict, trade: dict) -> dict:
+        key=re.sub(r"[^a-z0-9_]+","_",str(candidate.get("lesson_key","")).lower()).strip("_")[:80]
+        lesson=str(candidate.get("lesson","")).strip()[:400]
+        if not key or not lesson: return {"status":"REJECTED","reason":"empty candidate"}
+        conf=max(0,min(100,int(candidate.get("confidence",0))))
+        tags=[str(x).lower()[:40] for x in candidate.get("tags",[]) if str(x).strip()][:8]
+        row={"ts":time.time(),"lesson_key":key,"lesson":lesson,"confidence":conf,"tags":tags,"ticker":trade.get("ticker",""),"direction":trade.get("direction",""),"realized_pnl":trade.get("realized_pnl",0),"trade_id":trade.get("trade_id",""),"status":"CANDIDATE"}
+        with self._lock:
+            self._append(self.candidates_path,row)
+            same=[r for r in self._read(self.candidates_path) if r.get("lesson_key")==key]
+            avg=sum(float(r.get("confidence",0)) for r in same)/max(1,len(same))
+            already=any(r.get("lesson_key")==key and r.get("status")=="PROMOTED" for r in self._read(self.lessons_path))
+            if not already and len(same)>=self.PROMOTE_AFTER and avg>=self.MIN_AVG_CONFIDENCE:
+                promoted={"ts":time.time(),"lesson_key":key,"lesson":lesson,"tags":tags,"status":"PROMOTED","source":"AUTO_CORROBORATED_AAR","corroborations":len(same),"avg_confidence":round(avg,1)}
+                self._append(self.lessons_path,promoted)
+                return promoted
+        return {**row,"corroborations":len(same),"avg_confidence":round(avg,1)}
 
 
 class OpenAIDecisionEngine:
@@ -536,51 +685,48 @@ class OpenAIDecisionEngine:
     def decide(self, state: dict) -> dict:
         if not self.ready:
             raise RuntimeError("OPENAI_API_KEY is not configured.")
-        instructions = """You are MarketHound's tactical PAPER-TRADING decision engine.
-You are receiving live market telemetry for exactly one human-selected stock.
-Decide only among LONG, SHORT, HOLD, EXIT, FLAT. Never change trade size, ticker,
-armed-session profit target, or armed-session loss limit. Consider price relative to VWAP and the
-5-day SMA, RSI, volume ratio, recent prices, the tactical 1-minute candle window and its structural summary,
-current position, session P&L, cumulative Daily P&L context, the full-session price/trend context,
-and the open trade's MFE/MAE/profit-giveback + momentum-health telemetry when present.
-Use the tactical candle window to reason about LOCATION BEFORE DIRECTION: recent swing highs/lows, repeated rejection/reclaim areas,
-range position, VWAP/SMA interactions, candle progression, and whether participation is expanding or fading. Candle structure is supporting
-confirmation, not a standalone trigger.
+        instructions = """You are Luna, MarketHound's tactical decision engine for one human-selected stock.
 
-PRICE-ACTION / REGIME DOCTRINE:
-- PRICE TREND AND STRUCTURE COME FIRST. Indicators describe/qualify what price is doing; they do not overrule sustained observed price behavior.
-- Use session_trend_context to understand the longer battlefield while tactical_candles_1m describe the local fight.
-- VWAP and SMA5 are reference levels/context, NOT standalone LONG/SHORT signals. A print below VWAP alone is never sufficient reason to SHORT.
-- Repeated two-way VWAP crossings reduce VWAP's directional authority and usually imply balance/chop until price establishes acceptance or a confirmed break.
-- In a balanced/contested-VWAP regime, be especially selective with new SHORT entries. Require actual bearish price structure plus confirmation
-  (for example persistent lower highs/lows, failed reclaim + support break/retest, or a confirmed reversal structure such as double-top/H&S).
-  A named chart pattern is not required, but bearish control must be demonstrated rather than inferred from location below a reference line.
-- Repeated inability to stay above SMA5 is legitimate overhead-resistance context, but does not by itself justify shorting from the middle of a range.
-- Weight price structure/location first, then participation/volume, momentum, and indicator confirmation.
+MISSION / COMMANDER'S INTENT:
+- HUNT FOR POSITIVE EXPECTANCY. Your objective is positive realized P&L while preserving capital inside the deterministic mission envelope.
+- You have tactical discretion. LONG, SHORT, HOLD, EXIT, and FLAT are all valid decisions. Do not trade merely to be active, to satisfy a directional opinion, or to complete the session target.
+- Treat every supplied indicator, level, catalyst, derived measurement, candle pattern, and institutional-memory lesson as EVIDENCE / TOOLS, not commands. Decide what deserves weight in the CURRENT market regime.
+- Seek asymmetric opportunity: favorable location, credible continuation/reversal evidence, and enough room for the trade to pay relative to nearby opposing terrain and current risk.
+- Once engaged, remain only while the local opportunity continues to pay. EXIT may bank a good scalp without declaring the broader thesis reversed.
+- Explain concisely which evidence materially drove the decision and what would invalidate/re-open the setup. Do not recite the entire sensor suite.
 
-OPEN-POSITION MOMENTUM MANAGEMENT:
-- momentum_health is advisory evidence for deciding HOLD versus EXIT; it is NOT a deterministic trailing stop.
-- While favorable price progress continues and structure/participation remain healthy, HOLDing a winner is allowed even after meaningful MFE.
-- After meaningful MFE, actively watch for the impulse to STOP PAYING: several completed bars without a new favorable extreme, flattening or
-  adverse trade-direction price progress, repeated rejection, candle/range compression, and/or fading participation.
-- Prefer EXIT to ring the register when momentum deterioration is PERSISTENT AND CONFLUENT before a large retracement develops.
-- Do NOT exit because of one contrary candle, one noisy tick, a tiny stall, or a fixed dollar/percentage giveback. Require persistence/confluence.
-- EXIT does not mean the larger thesis reversed; it may simply mean the local scalp impulse is exhausted. MarketHound may re-enter later on a fresh setup.
+NON-NEGOTIABLE AUTHORITY BOUNDARIES:
+- Never change ticker, dollar exposure/trade size, armed-session Profit Target, armed-session Loss Limit, execution mode, or operator permissions.
+- Deterministic MarketHound controls own sizing, broker routing, market-hours restrictions, STOP/FLATTEN, session ROE, human override, and evidence capture. Your tactical discretion exists INSIDE those rails.
+- HOLD means maintain an existing position. EXIT means flatten an existing position. LONG/SHORT may only be used when currently FLAT. FLAT means take no position.
+- The state includes allow_shorts. If false, SHORT is prohibited; bearish evidence can justify FLAT or management of an existing position, never a new SHORT.
 
-SESSION SCALPING DOCTRINE:
-- The armed-session Profit Target is the cumulative session finish line, NOT a required profit for any single trade.
-- You may reach the session target through multiple smaller profitable scalps.
-- Do NOT hold a profitable trade merely because it has not reached the full remaining session target.
-- When an open trade has bankable profit and continuation evidence weakens, momentum/participation deteriorates,
-  price reaches nearby structure, or giveback from MFE becomes unattractive, prefer EXIT to bank partial session progress.
-- Do NOT use a fixed per-trade dollar take-profit. Let structure, participation, momentum, MFE, and giveback determine whether to bank.
-- Strong, well-supported continuation may justify HOLDing a winner; do not mechanically scalp every green trade.
-- After a profitable EXIT, MarketHound remains armed and may take another qualified setup until the session Profit Target
-  or Loss Limit is reached. Avoid forcing entries merely to complete the target. FLAT is always acceptable when no quality setup exists.
+AVAILABLE SENSOR / EVIDENCE SUITE:
+- Price relative to VWAP and SMA5, RSI, volume ratio, recent prices, tactical 1-minute candles/structure, full-session trend context, current position, armed-session and cumulative Daily P&L context.
+- catalyst_context: ARM-time ticker intelligence. News is context, never an order by itself. Ask whether the tape is STILL responding now, not merely whether a catalyst existed earlier.
+- directional_velocity_context: signed 1/3/5/10-minute velocity, efficiency, impulse-vs-pullback speed, acceleration, participation, and advisory move phase.
+- terrain_context: prior/session/premarket extremes, confirmed swing pivots, round-number handles, Fib retracements/confluence, and other deterministic price terrain.
+- equilibrium_context: current evidence about VWAP/SMA5 reference gravity versus catalyst-driven price discovery.
+- entry_location_context: advisory burden-of-proof around nearby support/resistance.
+- momentum_health plus open-trade MFE/MAE/giveback: evidence for whether an engaged scalp is still paying.
+- institutional_memory: locally persisted evidence-backed lessons. They are prior knowledge, not laws. Current tape wins conflicts.
 
-HOLD means maintain an existing position. EXIT means flatten an existing position.
-LONG/SHORT may only be used when currently FLAT. FLAT means take no position.
-The state includes allow_shorts. If allow_shorts is false, SHORT is prohibited: do not return SHORT; bearish setups must remain FLAT or manage an existing position normally.
+TACTICAL PRINCIPLES -- JUDGMENT, NOT A FLOWCHART:
+- PRICE STRUCTURE AND OBSERVED BEHAVIOR outrank indicator labels. A down day does not make every SHORT good; an up day does not make every LONG good. Direction and entry location are separate questions.
+- Levels are terrain; REACTION is evidence. VWAP, SMA5, support/resistance, Fib, round numbers, and prior extremes never independently require a trade.
+- VWAP is the session volume-weighted transaction-price reference; SMA5 is strategic multi-day reference terrain. Without market-confirmed sustained catalyst thrust, give these references meaningful equilibrium weight (Terra Firma). Displacement must keep proving itself with pressure, velocity, efficiency, participation, and structure.
+- A catalyst permits questioning the old equilibrium; it does not abolish gravity. Sustained EXPANDING/RE_EXPANDING price discovery can reduce reference-gravity weight. As thrust MATURES/ROTATES, reference terrain regains relevance.
+- In rotational/choppy conditions, do not keep chasing the old session direction. Hunt favorable edges/locations and demand reaction evidence. Middle-of-range/no-edge conditions favor FLAT.
+- Near support, a new SHORT deserves skepticism until sellers demonstrate failure/acceptance through the zone; near resistance, a new LONG deserves skepticism until buyers demonstrate acceptance through it. These are burdens of proof, not prohibitions. Strong current evidence may justify exceptions; explain why.
+- A support touch does not automatically mean LONG and a resistance touch does not automatically mean SHORT. Look for defense/reclaim/rejection/acceptance, velocity change, participation, and structure.
+- EXPANDING/RE_EXPANDING velocity may justify earlier participation when structure/location/participation align. MATURING raises chase risk. ROTATION increases the value of terrain and two-sided reasoning. High velocity alone is never enough.
+- For an open winner, HOLD while favorable progress/structure/participation remain healthy. Consider EXIT when the local edge persistently deteriorates or bankable profit is being surrendered. Do not use a fixed per-trade take-profit or exit on one noisy candle.
+- The armed-session Profit Target is a finish line that may be reached through multiple scalps, not a required profit for one trade. The Loss Limit and all deterministic risk controls are hard rails outside your discretion.
+- FLAT is an active tactical decision. When evidence is conflicting, location is poor, asymmetry is weak, or no setup has positive expected value, preserve capital and wait.
+
+DECISION STANDARD:
+Ask: Where is the asymmetric +$$ opportunity NOW? What evidence supports it? Is this a good PRICE/LOCATION to express it? What nearby terrain could stop it? Is the current move still paying or already mature? If the answers are weak, stay FLAT.
+
 Return ONLY compact valid JSON with keys: action, confidence, thesis, invalidation.
 confidence must be integer 0-100. thesis and invalidation must each be <= 240 chars.
 MarketHound may be running in PAPER or LIVE execution mode. You decide only the tactical action; deterministic MarketHound controls decide whether an allowed action is routed."""
@@ -619,6 +765,37 @@ MarketHound may be running in PAPER or LIVE execution mode. You decide only the 
                 "raw_output": raw_output,
             },
         }
+
+    def assess_news(self, symbol: str, stories: list[dict]) -> dict:
+        """Curate an ARM-time catalyst brief. News is context, never an order signal."""
+        if not self.ready: raise RuntimeError("OPENAI_API_KEY is not configured.")
+        compact=[]
+        for i,row in enumerate(stories[:12]):
+            compact.append({"index":i,"headline":row.get("headline",""),"summary":row.get("summary",""),"source":row.get("source",""),"created_at":row.get("created_at","")})
+        instructions = """You are Luna preparing MarketHound's ARM-time ticker intelligence brief. Identify only materially relevant, recent catalysts that could affect today's tape. News is CONTEXT, never a LONG/SHORT command. Deduplicate overlapping stories. Select at most 3 source stories. Return ONLY compact JSON with keys catalyst_status, bias, confidence, assessment, selected_indices. catalyst_status must be ACTIVE, NONE, or UNCLEAR. bias must be BULLISH, BEARISH, MIXED, or NEUTRAL. confidence 0-100. assessment <=500 chars and should explain likely market-behavior implications such as catalyst-driven displacement, volatility, price discovery, exhaustion/rotation risk, without predicting a required VWAP touch. selected_indices is an array of 0-3 integer indices into the supplied stories."""
+        payload={"ticker":str(symbol).upper(),"stories":compact}
+        response=self._client_obj().responses.create(model=self.model,instructions=instructions,input=json.dumps(payload,separators=(",",":")),store=False)
+        obj=self._extract_json(response.output_text)
+        status=str(obj.get("catalyst_status","UNCLEAR")).upper()
+        if status not in {"ACTIVE","NONE","UNCLEAR"}: status="UNCLEAR"
+        bias=str(obj.get("bias","NEUTRAL")).upper()
+        if bias not in {"BULLISH","BEARISH","MIXED","NEUTRAL"}: bias="NEUTRAL"
+        indices=[]
+        for x in obj.get("selected_indices",[]):
+            try: x=int(x)
+            except Exception: continue
+            if 0 <= x < len(stories) and x not in indices: indices.append(x)
+            if len(indices)>=3: break
+        return {"catalyst_status":status,"bias":bias,"confidence":max(0,min(100,int(obj.get("confidence",0)))),"assessment":str(obj.get("assessment", ""))[:500],"selected_indices":indices,"response_id":getattr(response,"id","")}
+
+    def distill_lesson(self, debrief: dict) -> dict:
+        """Propose one reusable lesson from a completed trade; never promotes it directly."""
+        if not self.ready: raise RuntimeError("OPENAI_API_KEY is not configured.")
+        instructions = """You are Luna conducting a disciplined post-trade AAR for MarketHound. Distill at most ONE reusable lesson supported by the supplied completed-trade evidence. Avoid ticker-specific superstition, day-of-week folklore, hindsight certainty, and rules based on one noisy candle. Prefer price structure, regime, participation, entry location, momentum health, MFE/MAE/giveback, or risk behavior. The lesson must be useful on future similar battlefields. Return ONLY compact JSON with keys lesson_key, lesson, confidence, tags. lesson_key must be stable lowercase snake_case <=80 chars. confidence is 0-100. tags is an array of <=8 short lowercase tags. lesson <=400 chars."""
+        started=time.perf_counter()
+        response=self._client_obj().responses.create(model=self.model,instructions=instructions,input=json.dumps(debrief,separators=(",",":")),store=False)
+        obj=self._extract_json(response.output_text)
+        return {"lesson_key":str(obj.get("lesson_key","")),"lesson":str(obj.get("lesson",""))[:400],"confidence":max(0,min(100,int(obj.get("confidence",0)))),"tags":list(obj.get("tags",[]))[:8],"latency_ms":round((time.perf_counter()-started)*1000,2),"response_id":getattr(response,"id","")}
 
     def review_human_entry(self, state: dict, direction: str, entry_price: float) -> dict:
         """Review a human operator entry without issuing or changing any trade action."""
@@ -717,19 +894,24 @@ class MarketHoundEngine:
         self.last_bar_age_sec = 0.0
         self.alpaca = AlpacaMarketData(app_config)
         self.stream = AlpacaLiveStream(app_config)
-        self.broker = AlpacaTradingClient(app_config)
+        self.paper_broker = AlpacaTradingClient(app_config, paper=True)
+        self.broker = AlpacaTradingClient(app_config, paper=False)
         self.ai = OpenAIDecisionEngine(app_config)
         self.live_execution_available = bool(app_config.get("live_execution_enabled", False))
         self.broker_account = {}
         self.broker_position = None
         self.last_broker_sync = 0.0
         self.last_broker_error = ""
+        self.last_broker_fill_price = 0.0
+        self.human_override_active = False
+        self.catalyst_context = {"status":"NOT_SCANNED","ticker":""}
         self.ai_interval = max(3.0, float(app_config.get("ai_interval_sec", os.getenv("AI_INTERVAL_SEC", "8"))))
         self.live_poll_interval = max(1.0, float(app_config.get("market_poll_sec", os.getenv("MARKET_POLL_SEC", "2"))))
         self.debug_capture = bool(app_config.get("default_debug_capture", False))
         app_root = Path(__file__).resolve().parents[1]
         self.evidence = EvidenceRecorder(app_root / "data" / "debug")
         self.trade_log = DailyTradeLog(app_root / "reports" / "trades")
+        self.lesson_memory = LocalLessonMemory(app_root / "data" / "memory")
         self.daily_realized_pnl = self.trade_log.realized_for_date(self._pnl_date_et, self.execution_mode)
         self.open_trade = None
         self._seed_initial_history()
@@ -744,13 +926,15 @@ class MarketHoundEngine:
         with self.lock:
             self.alpaca = AlpacaMarketData(app_config)
             self.stream = AlpacaLiveStream(app_config)
-            self.broker = AlpacaTradingClient(app_config)
+            self.paper_broker = AlpacaTradingClient(app_config, paper=True)
+            self.broker = AlpacaTradingClient(app_config, paper=False)
             self.ai = OpenAIDecisionEngine(app_config)
             self.live_execution_available = bool(app_config.get("live_execution_enabled", False))
             self.broker_account = {}
             self.broker_position = None
             self.last_broker_sync = 0.0
             self.last_broker_error = ""
+            self.last_broker_fill_price = 0.0
             self.ai_interval = max(3.0, float(app_config.get("ai_interval_sec", 8.0)))
             self.live_poll_interval = max(1.0, float(app_config.get("market_poll_sec", 2.0)))
             self.debug_capture = bool(app_config.get("default_debug_capture", self.debug_capture))
@@ -885,6 +1069,8 @@ class MarketHoundEngine:
             requested_exec = str(execution_mode or "PAPER").upper().strip()
             if requested_exec not in {"PAPER","LIVE"}:
                 requested_exec = "PAPER"
+            if requested_exec == "PAPER" and not self.paper_broker.ready:
+                raise RuntimeError("PAPER execution requires Alpaca Paper credentials (APCA_API_KEY_ID / APCA_API_SECRET_KEY).")
             if requested_exec == "LIVE":
                 if not self.live_mode:
                     raise RuntimeError("LIVE execution requires LIVE MARKET + AI.")
@@ -951,15 +1137,50 @@ class MarketHoundEngine:
             self.evidence.write("shorts_roe_changed", {"allow_shorts": self.allow_shorts, "position": self.position, "state": self._evidence_state()})
             return self.allow_shorts
 
+    def _arm_news_brief(self):
+        """Synchronous ARM-time preflight intel. Failure never blocks ARM.
+
+        The first visible Decision Log entry is an INTEL status call so the operator
+        can always tell that the preflight hook fired. The completed brief follows
+        before normal tactical evaluations are allowed to proceed.
+        """
+        self._record("INTEL",0,f"{self.ticker} preflight ticker-news scan started (48h).","SYSTEM")
+        self.evidence.write("arm_news_scan_started", {"ticker": self.ticker, "lookback_hours": 48})
+        if not (self.live_mode and self.alpaca.ready and self.ai.ready):
+            self.catalyst_context={"status":"UNAVAILABLE","ticker":self.ticker,"assessment":"Ticker intel unavailable; proceeding with price/volume evidence only."}
+            self._record("INTEL",0,self.catalyst_context["assessment"],"SYSTEM")
+            self.evidence.write("arm_news_brief_failed", {"ticker":self.ticker,"error":"market data or AI unavailable"})
+            return
+        try:
+            stories=self.alpaca.news(self.ticker, lookback_hours=48, limit=20)
+            if not stories:
+                self.catalyst_context={"status":"NONE","ticker":self.ticker,"bias":"NEUTRAL","confidence":100,"assessment":"No recent ticker-specific stories returned in the 48-hour ARM scan.","stories":[]}
+                self._record("INTEL",100,self.catalyst_context["assessment"],"LUNA INTEL")
+                self.evidence.write("arm_news_brief", self.catalyst_context)
+                return
+            assessment=self.ai.assess_news(self.ticker, stories)
+            selected=[stories[i] for i in assessment.get("selected_indices",[])][:3]
+            links=[{"label":(r.get("source") or "Open story")[:60],"url":r.get("url","")} for r in selected if r.get("url")][:3]
+            headlines=[r.get("headline","") for r in selected if r.get("headline")]
+            text=f"{self.ticker} ARM BRIEF — Catalyst {assessment['catalyst_status']} · Bias {assessment['bias']} · {assessment['assessment']}"
+            if headlines: text += " | " + " / ".join(headlines)
+            self.catalyst_context={"status":assessment["catalyst_status"],"ticker":self.ticker,"bias":assessment["bias"],"confidence":assessment["confidence"],"assessment":assessment["assessment"],"stories":selected}
+            self._record("INTEL",assessment["confidence"],text,"LUNA INTEL",links=links)
+            self.evidence.write("arm_news_brief", {**self.catalyst_context,"response_id":assessment.get("response_id","")})
+        except Exception as ex:
+            self.catalyst_context={"status":"UNAVAILABLE","ticker":self.ticker,"assessment":f"Ticker intel scan unavailable: {ex}. Proceeding with price/volume evidence only."}
+            self._record("INTEL",0,self.catalyst_context["assessment"],"SYSTEM")
+            self.evidence.write("arm_news_brief_failed", {"ticker":self.ticker,"error":str(ex)})
+
     def start(self):
         with self.lock:
             if self.running: return
             if not self.observing:
                 self._start_observation()
-            if self.execution_mode == "LIVE":
+            if self._broker_execution_enabled():
                 self._sync_broker(force=True)
                 if not self.broker_account:
-                    raise RuntimeError("Unable to read Alpaca LIVE account.")
+                    raise RuntimeError(f"Unable to read Alpaca {self.execution_mode} account.")
             # Every ARM / START establishes a fresh ROE session. Daily P&L is
             # durable accounting only and remains untouched here.
             self.realized_pnl = 0.0
@@ -979,6 +1200,7 @@ class MarketHoundEngine:
                 self.evidence.write("initial_state", self._evidence_state())
             self.running = True
             self.session_started_at = time.time()
+            self._arm_news_brief()
 
     def stop(self):
         """Orderly human stop: prevent new entries, flatten, then disarm."""
@@ -1034,7 +1256,7 @@ class MarketHoundEngine:
             entry_market_price = float(self.last_price or 0.0)
             if entry_market_price <= 0:
                 raise RuntimeError("Human entry blocked: no valid market price is available.")
-            if self.execution_mode == "LIVE":
+            if self._broker_execution_enabled():
                 routed = self._route_live_action(direction, "Human operator market entry.", enforce_short_roe=False)
                 # Alpaca market orders can be acknowledged just before the new
                 # position becomes visible. Give the broker a brief bounded
@@ -1046,13 +1268,14 @@ class MarketHoundEngine:
                         if self.position != "FLAT":
                             break
                 if routed not in {"LONG", "SHORT"} or self.position == "FLAT":
-                    raise RuntimeError("Human LIVE market entry was submitted but no broker position was confirmed.")
+                    raise RuntimeError(f"Human {self.execution_mode} market entry was submitted but no broker position was confirmed.")
             else:
                 self.position = direction
                 self.qty = self.trade_size / entry_market_price
                 self.entry_price = entry_market_price
                 self._update_pnl()
             actual_entry = float(self.entry_price or entry_market_price)
+            self.human_override_active = True
             self._record(direction, 100, "Human operator market entry.", "HUMAN")
             self.evidence.write("human_market_entry", {
                 "direction": direction, "entry_price": actual_entry,
@@ -1286,7 +1509,7 @@ class MarketHoundEngine:
                 newest_bar = bar
 
             self._refresh_market_session()
-            if self.execution_mode == "LIVE": self._sync_broker()
+            if self._broker_execution_enabled(): self._sync_broker()
             self.evidence.write("market_snapshot", {
                 "source": f"ALPACA {self.alpaca.feed.upper()} STREAM",
                 "provenance": {
@@ -1364,31 +1587,39 @@ class MarketHoundEngine:
         return ratio
 
 
+    def _active_broker(self) -> AlpacaTradingClient:
+        return self.broker if self.execution_mode == "LIVE" else self.paper_broker
+
+    def _broker_execution_enabled(self) -> bool:
+        return self.execution_mode in {"PAPER", "LIVE"}
+
     def _sync_broker(self, force: bool = False):
-        if self.execution_mode != "LIVE" or not self.broker.ready:
+        broker = self._active_broker()
+        if not self._broker_execution_enabled() or not broker.ready:
             return
         now = time.time()
         if not force and now - self.last_broker_sync < 5.0:
             return
         try:
-            self.broker_account = self.broker.account()
-            self.broker_position = self.broker.position(self.ticker)
+            self.broker_account = broker.account()
+            self.broker_position = broker.position(self.ticker)
             self.last_broker_sync = now
             self.last_broker_error = ""
             self._adopt_broker_position()
             self.evidence.write("broker_sync", {
                 "account": self._broker_account_public(),
                 "position": self._broker_position_public(),
-                "requests": self.broker.drain_request_events(),
+                "requests": broker.drain_request_events(),
             })
         except Exception as ex:
             self.last_broker_error = str(ex)
-            self.evidence.write("broker_error", {"error": str(ex), "requests": self.broker.drain_request_events()})
+            self.evidence.write("broker_error", {"error": str(ex), "requests": broker.drain_request_events()})
 
     def _adopt_broker_position(self):
         p = self.broker_position
         if not p:
             self.position = "FLAT"; self.qty = 0.0; self.entry_price = 0.0; self.unrealized_pnl = 0.0
+            self.human_override_active = False
             return
         side = str(p.get("side","")).lower()
         self.position = "LONG" if side == "long" else ("SHORT" if side == "short" else "FLAT")
@@ -1404,7 +1635,7 @@ class MarketHoundEngine:
         def f(k):
             try: return float(a.get(k,0) or 0)
             except Exception: return 0.0
-        return {"label": self.broker.label, "status": str(a.get("status","")),
+        return {"label": self._active_broker().label, "status": str(a.get("status","")),
                 "account_number_tail": str(a.get("account_number",""))[-4:],
                 "equity": f("equity"), "buying_power": f("buying_power"),
                 "cash": f("cash"), "portfolio_value": f("portfolio_value"),
@@ -1424,29 +1655,48 @@ class MarketHoundEngine:
                 "current_price":f("current_price")}
 
     def _route_live_action(self, action: str, thesis: str, enforce_short_roe: bool = True) -> str:
-        if self.execution_mode != "LIVE":
+        if not self._broker_execution_enabled():
             return action
+        broker = self._active_broker()
+        mode = self.execution_mode
         self._sync_broker(force=True)
         if self.market_session != "MARKET OPEN":
-            raise RuntimeError(f"LIVE order blocked: session is {self.market_session}; hf11 live execution is regular-hours only.")
+            raise RuntimeError(f"{mode} order blocked: session is {self.market_session}; broker execution is regular-hours only.")
         if self.broker_account.get("trading_blocked"):
-            raise RuntimeError("LIVE order blocked: Alpaca account reports trading_blocked.")
+            raise RuntimeError(f"{mode} order blocked: Alpaca account reports trading_blocked.")
         if action in {"LONG","SHORT"}:
             if action == "SHORT" and enforce_short_roe and not self.allow_shorts:
                 self.evidence.write("short_entry_blocked", {"ticker": self.ticker, "price": self.last_price, "thesis": thesis, "execution_mode": self.execution_mode})
                 return "FLAT"
             if self.broker_position:
                 return "HOLD"
-            qty = max(0.000001, self.trade_size / max(self.last_price, 0.01))
-            order = self.broker.submit_market_order(self.ticker, "buy" if action=="LONG" else "sell", qty)
-            self.evidence.write("live_order_submitted", {"action":action,"order":order,"thesis":thesis,"requests":self.broker.drain_request_events()})
+            raw_qty = max(0.000001, self.trade_size / max(self.last_price, 0.01))
+            # Alpaca does not support opening SHORT positions with fractional sell orders.
+            # Keep long entries fractional-capable, but round short exposure down to whole shares.
+            qty = float(math.floor(raw_qty)) if action == "SHORT" else raw_qty
+            if action == "SHORT" and qty < 1:
+                raise RuntimeError(f"{mode} SHORT blocked: dollar exposure is insufficient for one whole share at current price.")
+            order = broker.submit_market_order(self.ticker, "buy" if action=="LONG" else "sell", qty)
+            order = broker.wait_for_fill(order)
+            try: self.last_broker_fill_price = float(order.get("filled_avg_price", 0) or 0)
+            except Exception: self.last_broker_fill_price = 0.0
+            self.evidence.write("broker_order_submitted", {"broker_mode":mode,"action":action,"order":order,"thesis":thesis,"requests":broker.drain_request_events()})
             self._sync_broker(force=True)
             return action
         if action == "EXIT":
             if not self.broker_position:
                 return "FLAT"
-            order = self.broker.close_position(self.ticker)
-            self.evidence.write("live_position_close_submitted", {"order":order,"thesis":thesis,"requests":self.broker.drain_request_events()})
+            direction_before = self.position
+            entry_before = float(self.entry_price or 0.0)
+            qty_before = float(self.qty or 0.0)
+            order = broker.close_position(self.ticker)
+            order = broker.wait_for_fill(order)
+            try: self.last_broker_fill_price = float(order.get("filled_avg_price", 0) or 0)
+            except Exception: self.last_broker_fill_price = 0.0
+            fill = float(self.last_broker_fill_price or self.last_price or 0.0)
+            realized = ((fill-entry_before)*qty_before) if direction_before=="LONG" else ((entry_before-fill)*qty_before)
+            self.realized_pnl += realized
+            self.evidence.write("broker_position_close_submitted", {"broker_mode":mode,"order":order,"broker_realized_pnl":round(realized,6),"thesis":thesis,"requests":broker.drain_request_events()})
             self._sync_broker(force=True)
             return "EXIT"
         return action
@@ -1512,7 +1762,7 @@ class MarketHoundEngine:
         exit_ts = time.time()
         shares = float(t.get("shares", 0) or 0)
         entry_price = float(t.get("entry_price", 0) or 0)
-        exit_price = float(self.last_price or 0)
+        exit_price = float(self.last_broker_fill_price or self.last_price or 0) if self._broker_execution_enabled() else float(self.last_price or 0)
         direction = str(t.get("direction", "FLAT"))
         pnl = ((exit_price-entry_price)*shares) if direction=="LONG" else ((entry_price-exit_price)*shares)
         entry_value = abs(shares*entry_price)
@@ -1549,6 +1799,15 @@ class MarketHoundEngine:
                 "mae_price": round(self.trade_mae_price, 6),
             },
         })
+        # Institutional Memory AAR: propose locally, corroborate across sorties,
+        # and only then auto-promote. Failure here can never affect execution.
+        try:
+            debrief={"trade":{k:row.get(k,"") for k in self.trade_log.FIELDS},"excursion":{"mfe_pnl":round(self.trade_mfe_pnl,2),"mae_pnl":round(self.trade_mae_pnl,2),"profit_giveback":round(max(0.0,self.trade_mfe_pnl-max(0.0,pnl)),2),"mfe_price":round(self.trade_mfe_price,6),"mae_price":round(self.trade_mae_price,6)},"session_trend_context":self._session_trend_context(390),"tactical_summary":self._tactical_context(60)[1]}
+            candidate=self.ai.distill_lesson(debrief)
+            memory_result=self.lesson_memory.add_candidate(candidate,row)
+            self.evidence.write("institutional_memory_aar",{"candidate":candidate,"memory_result":memory_result,"trade_id":row.get("trade_id","")})
+        except Exception as ex:
+            self.evidence.write("institutional_memory_aar_error",{"error":str(ex),"trade_id":row.get("trade_id","")})
         self.open_trade = None
         self.trade_mfe_pnl = 0.0
         self.trade_mae_pnl = 0.0
@@ -1578,32 +1837,35 @@ class MarketHoundEngine:
         exit_price = float(self.last_price or 0.0)
         qty = float(self.qty or 0.0)
         est_pnl = ((exit_price-entry_price)*qty) if direction=="LONG" else ((entry_price-exit_price)*qty)
-        if self.execution_mode == "LIVE":
+        if self._broker_execution_enabled():
             try:
                 self._route_live_action("EXIT", reason)
             except Exception as ex:
                 self.last_broker_error = str(ex)
-                self._record("HOLD",0,f"LIVE EXIT FAILED: {ex}","SYSTEM")
+                self._record("HOLD",0,f"{self.execution_mode} EXIT FAILED: {ex}","SYSTEM")
                 return
+            broker_exit_price = float(self.last_broker_fill_price or exit_price)
+            broker_pnl = ((broker_exit_price-entry_price)*qty) if direction=="LONG" else ((entry_price-broker_exit_price)*qty)
             self._trade_close_if_open(99, reason, source)
-            self.realized_pnl += est_pnl
             self._refresh_daily_realized_pnl()
-            self._record("EXIT",99,f"Exit ${exit_price:.2f} | {direction} | Est. P&L {est_pnl:+.2f} | {reason}",source)
+            self.human_override_active = False
+            self._record("EXIT",99,f"Exit ${broker_exit_price:.2f} | {direction} | Broker P&L {broker_pnl:+.2f} | {reason}",source)
             return
         self._trade_close_if_open(99, reason, source)
         self.realized_pnl += self.unrealized_pnl
         self._refresh_daily_realized_pnl()
         self.position="FLAT"; self.qty=0.0; self.entry_price=0.0; self.unrealized_pnl=0.0
+        self.human_override_active = False
         self._record("EXIT",99,f"Exit ${exit_price:.2f} | {direction} | Realized {est_pnl:+.2f} | {reason}",source)
 
-    def _record(self, action: str, confidence: int, thesis: str, source: str, invalidation: str = ""):
+    def _record(self, action: str, confidence: int, thesis: str, source: str, invalidation: str = "", links: Optional[list[dict]] = None):
         display_thesis = thesis
         if action in {"LONG","SHORT"}:
             self._trade_open_if_needed(action, confidence, thesis, source)
             display_thesis = f"ENTRY ${self.entry_price:.2f} | {action} | {thesis}"
         elif action == "EXIT":
             self._trade_close_if_open(confidence, thesis, source)
-        decision = Decision(time.time(),action,confidence,display_thesis,self.last_price,self._vwap(),self._sma5(),self._rsi(),self._volume_ratio(),source,invalidation)
+        decision = Decision(time.time(),action,confidence,display_thesis,self.last_price,self._vwap(),self._sma5(),self._rsi(),self._volume_ratio(),source,invalidation,list(links or [])[:3])
         self.decisions.append(decision)
         self.evidence.write("decision_applied", {"decision": asdict(decision), "state_after": self._evidence_state()})
 
@@ -1656,13 +1918,14 @@ class MarketHoundEngine:
             "daily_total_pnl": round(self.daily_realized_pnl + self.unrealized_pnl, 6),
             "daily_pnl_date_et": self._pnl_date_et.isoformat(),
             "starting_equity": round(self.starting_equity, 2),
-            "equity": round(self.starting_equity + self.realized_pnl + self.unrealized_pnl, 2),
-            "buying_power": round(self.starting_equity + self.realized_pnl - (self.trade_size if self.position != "FLAT" else 0.0), 2),
+            "equity": round(float((self.broker_account or {}).get("equity",0) or 0),2) if self._broker_execution_enabled() else round(self.starting_equity + self.realized_pnl + self.unrealized_pnl, 2),
+            "buying_power": round(float((self.broker_account or {}).get("buying_power",0) or 0),2) if self._broker_execution_enabled() else round(self.starting_equity + self.realized_pnl - (self.trade_size if self.position != "FLAT" else 0.0), 2),
             "profit_target": self.profit_target, "loss_limit": self.loss_limit,
             "market_status": self.market_status, "market_session": self.market_session,
             "data_source": self.data_source, "price_source": self.price_source,
             "indicator_source": self.indicator_source, "bar_age_sec": round(self.last_bar_age_sec, 2),
             "ai_status": self.ai_status, "last_bar_ts": self.last_bar_ts,
+            "move_phase": self._directional_velocity_context(30),
         }
 
     def _tactical_context(self, max_bars: int = 60) -> tuple[list[dict], dict]:
@@ -1921,6 +2184,330 @@ class MarketHoundEngine:
             "sma5_behavior": side_stats(sma5s, "sma5"),
         }
 
+
+    def _directional_velocity_context(self, max_bars: int = 30) -> dict:
+        """Deterministic move-speed / phase telemetry for Luna.
+
+        Uses same-session completed 1-minute bars only. This is advisory context,
+        not an execution gate. The goal is to distinguish a fresh expanding
+        impulse from a mature/choppy move without adding another lagging
+        indicator stack.
+        """
+        now_et = datetime.now(NY)
+        active_date = now_et.date()
+        active_session = self.market_session
+        bars = []
+        for t in self.ticks:
+            try:
+                dt_et = datetime.fromtimestamp(float(t.ts), timezone.utc).astimezone(NY)
+            except Exception:
+                continue
+            if dt_et.date() != active_date or self._session_label(dt_et) != active_session:
+                continue
+            if t.close is None:
+                continue
+            bars.append(t)
+        bars = bars[-max_bars:]
+        if len(bars) < 2:
+            return {"phase": "DEVELOPING", "direction": "NEUTRAL", "bars": len(bars)}
+
+        closes = [float(t.close) for t in bars]
+        volumes = [max(0.0, float(t.volume or 0)) for t in bars]
+
+        def velocity(n: int) -> dict:
+            if len(closes) < 2:
+                return {"bars": len(closes), "pct_per_min": 0.0, "bps_per_min": 0.0}
+            use = min(n, len(closes)-1)
+            start = closes[-1-use]
+            end = closes[-1]
+            pct = ((end-start)/start*100.0/use) if start else 0.0
+            return {"bars": use, "pct_per_min": round(pct,4), "bps_per_min": round(pct*100.0,2)}
+
+        def efficiency(n: int) -> float:
+            use = min(n, len(closes)-1)
+            if use < 1:
+                return 0.0
+            w = closes[-1-use:]
+            path = sum(abs(b-a) for a,b in zip(w[:-1], w[1:]))
+            net = abs(w[-1]-w[0])
+            return round((net/path) if path > 0 else 0.0, 3)
+
+        v1, v3, v5, v10 = velocity(1), velocity(3), velocity(5), velocity(10)
+        signed_basis = v5["pct_per_min"] if abs(v5["pct_per_min"]) >= abs(v3["pct_per_min"])*0.35 else v3["pct_per_min"]
+        if signed_basis > 0.01:
+            direction = "UP"
+            sign = 1.0
+        elif signed_basis < -0.01:
+            direction = "DOWN"
+            sign = -1.0
+        else:
+            direction = "NEUTRAL"
+            sign = 0.0
+
+        # Compare favorable 1-minute bar speed with adverse pullback speed.
+        recent = closes[-11:] if len(closes) >= 11 else closes
+        favorable=[]; adverse=[]
+        for a,b in zip(recent[:-1], recent[1:]):
+            pct=((b-a)/a*100.0) if a else 0.0
+            if sign == 0:
+                continue
+            signed = sign*pct
+            if signed > 0:
+                favorable.append(signed)
+            elif signed < 0:
+                adverse.append(abs(signed))
+        fav_speed = (sum(favorable)/len(favorable)) if favorable else 0.0
+        adv_speed = (sum(adverse)/len(adverse)) if adverse else 0.0
+        pullback_ratio = (adv_speed/fav_speed) if fav_speed > 0 else (1.0 if adv_speed > 0 else 0.0)
+        favorable_fraction = (len(favorable)/(len(favorable)+len(adverse))) if (favorable or adverse) else 0.5
+
+        e3=efficiency(3); e5=efficiency(5); e10=efficiency(10)
+        speed3=abs(v3["pct_per_min"]); speed5=abs(v5["pct_per_min"]); speed10=abs(v10["pct_per_min"])
+        acceleration = (speed3-speed10) if v10["bars"] >= 5 else (speed3-speed5)
+        volume_ratio = float(self._volume_ratio())
+
+        # Generic, intentionally soft phase classifier. Luna still reasons over
+        # the full state. Thresholds are percentages/minute, so they transfer
+        # better across tickers than raw dollar moves.
+        phase = "ROTATION"
+        if direction != "NEUTRAL":
+            reexpanding = (e3 >= 0.70 and e10 < 0.62 and speed3 >= max(0.035, speed10*1.35) and pullback_ratio <= 0.70)
+            expanding = (speed5 >= 0.035 and e5 >= 0.62 and favorable_fraction >= 0.60 and pullback_ratio <= 0.70 and volume_ratio >= 1.05)
+            if reexpanding:
+                phase = "RE_EXPANDING"
+            elif expanding and acceleration >= -0.01:
+                phase = "EXPANDING"
+            elif speed5 >= 0.015 or e5 >= 0.48:
+                phase = "MATURING"
+
+        # Opening/catalyst flags are descriptive only.
+        minutes_from_open = None
+        if active_session == "MARKET OPEN":
+            open_dt = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+            minutes_from_open = max(0.0, (now_et-open_dt).total_seconds()/60.0)
+        opening_window = bool(minutes_from_open is not None and minutes_from_open <= 45.0)
+        catalyst_active = str((self.catalyst_context or {}).get("status","")).upper() == "ACTIVE"
+
+        return {
+            "bars": len(bars),
+            "direction": direction,
+            "phase": phase,
+            "opening_window": opening_window,
+            "minutes_from_open": round(minutes_from_open,1) if minutes_from_open is not None else None,
+            "catalyst_active": catalyst_active,
+            "velocity_1m": v1,
+            "velocity_3m": v3,
+            "velocity_5m": v5,
+            "velocity_10m": v10,
+            "directional_efficiency_3m": e3,
+            "directional_efficiency_5m": e5,
+            "directional_efficiency_10m": e10,
+            "favorable_bar_fraction_10m": round(favorable_fraction,3),
+            "impulse_bar_speed_pct": round(fav_speed,4),
+            "pullback_bar_speed_pct": round(adv_speed,4),
+            "pullback_to_impulse_speed_ratio": round(pullback_ratio,3),
+            "speed_acceleration_pct_per_min": round(acceleration,4),
+            "participation_volume_ratio": round(volume_ratio,3),
+        }
+
+    def _terrain_context(self, max_bars: int = 120) -> dict:
+        """Deterministic price-terrain map for Luna; never an order trigger.
+
+        Keeps the cockpit clean while exposing objective reference zones: prior-day
+        H/L/C, current-session and premarket extremes, recent confirmed swing
+        pivots, round-number proximity, and Fibonacci retracements anchored to the
+        dominant same-session impulse. Luna should cite only terrain that actually
+        matters to the current decision.
+        """
+        now_et = datetime.now(NY)
+        today = now_et.date()
+        rows = []
+        for t in self.ticks:
+            try:
+                dt = datetime.fromtimestamp(float(t.ts), timezone.utc).astimezone(NY)
+            except Exception:
+                continue
+            c = float(t.close if t.close is not None else t.price)
+            h = float(t.high if t.high is not None else c)
+            l = float(t.low if t.low is not None else c)
+            rows.append((dt, t, c, h, l))
+        if not rows:
+            return {"status": "NO_DATA"}
+
+        price = float(self.last_price or rows[-1][2])
+        def zone(name, level, kind, source):
+            if level is None or price <= 0:
+                return None
+            level=float(level)
+            dist=price-level
+            return {"name":name,"level":round(level,4),"kind":kind,"source":source,
+                    "distance":round(dist,4),"distance_pct":round(dist/price*100.0,3)}
+
+        levels=[]
+        # Prior trading date represented in our bootstrap data.
+        dates=sorted({dt.date() for dt,_,_,_,_ in rows if dt.date() < today})
+        if dates:
+            pd=dates[-1]
+            prior=[r for r in rows if r[0].date()==pd and self._session_label(r[0])=="MARKET OPEN"]
+            if prior:
+                levels += [zone("prior_day_high",max(r[3] for r in prior),"RESISTANCE","PRIOR_DAY"),
+                           zone("prior_day_low",min(r[4] for r in prior),"SUPPORT","PRIOR_DAY"),
+                           zone("prior_day_close",prior[-1][2],"REFERENCE","PRIOR_DAY")]
+
+        today_rows=[r for r in rows if r[0].date()==today]
+        pre=[r for r in today_rows if self._session_label(r[0])=="PREMARKET"]
+        reg=[r for r in today_rows if self._session_label(r[0])=="MARKET OPEN"]
+        if pre:
+            levels += [zone("premarket_high",max(r[3] for r in pre),"RESISTANCE","PREMARKET"),
+                       zone("premarket_low",min(r[4] for r in pre),"SUPPORT","PREMARKET")]
+        if reg:
+            levels += [zone("session_high",max(r[3] for r in reg),"RESISTANCE","SESSION"),
+                       zone("session_low",min(r[4] for r in reg),"SUPPORT","SESSION")]
+
+        # Confirmed 3-bar swing pivots. Keep only the newest distinct levels.
+        active=[r for r in today_rows if self._session_label(r[0])==self.market_session][-max_bars:]
+        pivots=[]
+        for i in range(2,len(active)-2):
+            w=active[i-2:i+3]; cur=active[i]
+            if cur[3] == max(x[3] for x in w): pivots.append((cur[0],cur[3],"RESISTANCE","swing_high"))
+            if cur[4] == min(x[4] for x in w): pivots.append((cur[0],cur[4],"SUPPORT","swing_low"))
+        kept=[]
+        for dt,lvl,kind,name in reversed(pivots):
+            if any(abs(lvl-x[1]) / max(price,1e-9) < 0.0015 for x in kept):
+                continue
+            kept.append((dt,lvl,kind,name))
+            if len(kept)>=6: break
+        for dt,lvl,kind,name in reversed(kept):
+            z=zone(name,lvl,kind,"CONFIRMED_5BAR_PIVOT")
+            if z: z["observed_at"]=dt.isoformat(); levels.append(z)
+
+        # Round-number terrain: nearest $1 and $5 handles, descriptive only.
+        for step,label in ((1.0,"round_1"),(5.0,"round_5")):
+            lvl=round(price/step)*step
+            levels.append(zone(label,lvl,"REFERENCE","ROUND_NUMBER"))
+
+        # Objective dominant impulse from same-session extrema in the recent window.
+        # Endpoint order determines UP vs DOWN; no hand-picked anchor.
+        fib=None
+        impulse=active[-min(60,len(active)):] if active else []
+        if len(impulse)>=5:
+            hi_i=max(range(len(impulse)), key=lambda i: impulse[i][3])
+            lo_i=min(range(len(impulse)), key=lambda i: impulse[i][4])
+            hi=impulse[hi_i][3]; lo=impulse[lo_i][4]
+            span=hi-lo
+            if lo>0 and span/lo >= 0.003:
+                direction="UP" if lo_i < hi_i else "DOWN"
+                ratios=(0.382,0.5,0.618)
+                fib_levels=[]
+                for r in ratios:
+                    lvl=hi-span*r if direction=="UP" else lo+span*r
+                    fib_levels.append({"ratio":r,"level":round(lvl,4),
+                                       "distance_pct":round((price-lvl)/price*100.0,3) if price else 0.0})
+                fib={"anchor_rule":"RECENT_60BAR_DOMINANT_EXTREMA_ORDER",
+                     "direction":direction,"low":round(lo,4),"high":round(hi,4),
+                     "range_pct":round(span/lo*100.0,3),"levels":fib_levels}
+                for f in fib_levels:
+                    levels.append(zone(f"fib_{int(f['ratio']*1000)}",f["level"],"REFERENCE","FIB_RETRACEMENT"))
+
+        levels=[x for x in levels if x]
+        levels.sort(key=lambda x: abs(x["distance_pct"]))
+        nearby=[x for x in levels if abs(x["distance_pct"]) <= 0.75][:8]
+        # Confluence clusters within 0.15% of price; distinct sources only.
+        confluence=[]
+        for base in nearby:
+            cluster=[x for x in nearby if abs(x["level"]-base["level"])/max(price,1e-9) <= 0.0015]
+            sources=sorted({x["source"] for x in cluster})
+            if len(sources)>=2:
+                names=sorted({x["name"] for x in cluster})
+                item={"center":round(sum(x["level"] for x in cluster)/len(cluster),4),
+                      "levels":names,"sources":sources}
+                if item not in confluence: confluence.append(item)
+        return {"status":"OK","price":round(price,4),"nearby_levels":nearby,
+                "confluence_zones":confluence[:4],"fib_impulse":fib,
+                "doctrine":"LEVELS_ARE_TERRAIN_REACTION_IS_EVIDENCE"}
+
+    def _equilibrium_context(self, velocity_context: dict) -> dict:
+        """Advisory VWAP/SMA5 equilibrium weighting for Luna; never an order trigger.
+
+        No active catalyst -> references receive high Terra-Firma weight.  An ACTIVE
+        catalyst reduces that weight only when the tape itself confirms sustained
+        repricing pressure.  As the impulse matures/rotates, reference weight rises
+        again.
+        """
+        price=float(self.last_price or 0.0)
+        vwap=float(self._vwap() or 0.0)
+        sma5=float(self._sma5() or 0.0)
+        vc=velocity_context or {}
+        phase=str(vc.get("phase","UNKNOWN")).upper()
+        direction=str(vc.get("direction","NEUTRAL")).upper()
+        vr=float(vc.get("participation_volume_ratio", self._volume_ratio()) or 0.0)
+        eff=float(vc.get("directional_efficiency_5m", vc.get("directional_efficiency_10m",0.0)) or 0.0)
+        accel=float(vc.get("speed_acceleration_pct_per_min",0.0) or 0.0)
+        catalyst_active=str((self.catalyst_context or {}).get("status","")).upper()=="ACTIVE"
+        tape_repricing = bool(catalyst_active and phase in {"EXPANDING","RE_EXPANDING"} and direction in {"UP","DOWN"} and vr >= 1.25 and eff >= 0.55)
+        if not catalyst_active:
+            weight="HIGH"; regime="TERRA_FIRMA"
+            reason="No active catalyst: VWAP/SMA5 receive high equilibrium/reference weight; displacement must be sustained by tape pressure."
+        elif tape_repricing:
+            weight="REDUCED"; regime="CATALYST_REPRICING"
+            reason="Active catalyst is confirmed by expanding/re-expanding directional tape; price discovery gets priority while pressure persists."
+        elif phase in {"MATURING","ROTATION"}:
+            weight="HIGH"; regime="GRAVITY_REASSERTING"
+            reason="Catalyst exists but impulse is maturing/rotating; VWAP/SMA5 equilibrium weight is restored."
+        else:
+            weight="MEDIUM_HIGH"; regime="CATALYST_UNCONFIRMED"
+            reason="Catalyst exists but tape has not proven sustained repricing; reference gravity remains important."
+        def dist(ref):
+            return round(((price-ref)/ref*100.0),4) if ref else 0.0
+        return {
+            "status":"OK", "regime":regime, "reference_gravity_weight":weight,
+            "catalyst_active":catalyst_active, "tape_repricing_confirmed":tape_repricing,
+            "phase":phase, "direction":direction, "participation_volume_ratio":round(vr,3),
+            "directional_efficiency":round(eff,3), "speed_acceleration_pct_per_min":round(accel,4),
+            "price":round(price,4), "vwap":round(vwap,4), "sma5":round(sma5,4),
+            "distance_from_vwap_pct":dist(vwap), "distance_from_sma5_pct":dist(sma5),
+            "reason":reason,
+            "doctrine":"NO_CATALYST_TERRA_FIRMA_CATALYST_MUST_BE_CONFIRMED_BY_THRUST",
+        }
+
+    def _entry_location_context(self, terrain_context: dict, velocity_context: dict) -> dict:
+        """Advisory entry-location guardrail for Luna; never an order trigger.
+
+        Near established support, a new SHORT needs evidence that support is failing.
+        Near established resistance, a new LONG needs evidence that resistance is
+        accepting/breaking.  The model still judges the reaction from tactical candles,
+        structure, velocity and participation; this helper simply makes proximity and
+        the burden-of-proof explicit.
+        """
+        if not isinstance(terrain_context, dict) or terrain_context.get("status") != "OK":
+            return {"status":"NO_TERRAIN"}
+        price=float(self.last_price or 0.0)
+        if price <= 0:
+            return {"status":"NO_PRICE"}
+        levels=terrain_context.get("nearby_levels") or []
+        supports=[x for x in levels if x.get("kind")=="SUPPORT" and float(x.get("level",0)) <= price * 1.0025]
+        resistances=[x for x in levels if x.get("kind")=="RESISTANCE" and float(x.get("level",0)) >= price * 0.9975]
+        supports.sort(key=lambda x: abs(float(x.get("distance_pct",999))))
+        resistances.sort(key=lambda x: abs(float(x.get("distance_pct",999))))
+        sup=supports[0] if supports else None
+        res=resistances[0] if resistances else None
+        near_pct=0.35
+        near_support=bool(sup and abs(float(sup.get("distance_pct",999))) <= near_pct)
+        near_resistance=bool(res and abs(float(res.get("distance_pct",999))) <= near_pct)
+        phase=str((velocity_context or {}).get("phase","UNKNOWN"))
+        return {
+            "status":"OK",
+            "nearest_support":sup,
+            "nearest_resistance":res,
+            "near_support":near_support,
+            "near_resistance":near_resistance,
+            "proximity_threshold_pct":near_pct,
+            "move_phase":phase,
+            "short_entry_burden":"PROVE_SUPPORT_FAILURE" if near_support else "NORMAL",
+            "long_entry_burden":"PROVE_RESISTANCE_ACCEPTANCE" if near_resistance else "NORMAL",
+            "doctrine":"SUPPORT_RESPECTED_UNTIL_FAILURE_RESISTANCE_RESPECTED_UNTIL_ACCEPTANCE",
+        }
+
     def _momentum_health(self) -> dict:
         """Advisory open-trade impulse telemetry; never a hard exit rule."""
         if self.position not in {"LONG", "SHORT"} or not self.open_trade:
@@ -2007,6 +2594,12 @@ class MarketHoundEngine:
         tactical_candles, tactical_summary = self._tactical_context(60)
         session_trend_context = self._session_trend_context(390)
         momentum_health = self._momentum_health()
+        directional_velocity_context = self._directional_velocity_context(30)
+        terrain_context = self._terrain_context(120)
+        equilibrium_context = self._equilibrium_context(directional_velocity_context)
+        entry_location_context = self._entry_location_context(terrain_context, directional_velocity_context)
+        memory_probe = {"ticker": self.ticker, "market_session": self.market_session, "session_trend_context": session_trend_context, "momentum_health": momentum_health, "directional_velocity_context": directional_velocity_context, "terrain_context": terrain_context, "equilibrium_context": equilibrium_context, "entry_location_context": entry_location_context}
+        institutional_memory = self.lesson_memory.promoted(memory_probe, limit=8)
         return {
             "ticker":self.ticker,"position":self.position,"execution_mode":self.execution_mode,"allow_shorts":self.allow_shorts,"price":round(self.last_price,4),
             "vwap":round(self._vwap(),4),"sma5":round(self._sma5(),4),"rsi":round(self._rsi(),2),
@@ -2032,6 +2625,14 @@ class MarketHoundEngine:
             "tactical_summary": tactical_summary,
             "session_trend_context": session_trend_context,
             "momentum_health": momentum_health,
+            "directional_velocity_context": directional_velocity_context,
+            "terrain_context": terrain_context,
+            "equilibrium_context": equilibrium_context,
+            "entry_location_context": entry_location_context,
+            "institutional_memory": institutional_memory,
+            "catalyst_context": self.catalyst_context,
+            "human_override_active": bool(self.human_override_active and self.position != "FLAT"),
+            "position_authority": "HUMAN" if (self.human_override_active and self.position != "FLAT") else "AI",
         }
 
     def _maybe_decide_ai(self):
@@ -2048,23 +2649,42 @@ class MarketHoundEngine:
             "normalized_decision": {k: d[k] for k in ("action", "confidence", "thesis", "invalidation")},
             "state_before_apply": self._evidence_state(),
         })
+        # HUMAN OVERRIDE owns execution authority for a human-entered position.
+        # Luna still evaluates and posts her thesis, but deterministic routing
+        # suppresses every AI order/exit until the human position is flattened.
+        if self.human_override_active and self.position != "FLAT":
+            self.evidence.write("ai_action_suppressed_human_override", {
+                "proposed_action": action, "confidence": d["confidence"],
+                "thesis": d["thesis"], "invalidation": d["invalidation"],
+                "state": self._evidence_state(),
+            })
+            self._record(
+                "REVIEW", d["confidence"],
+                f"HUMAN OVERRIDE — OBSERVATION ONLY | Luna proposed {action}: {d['thesis']}",
+                "OPENAI REVIEW", d["invalidation"],
+            )
+            return
         # State-contract enforcement: model decides; deterministic MarketHound validates routing.
         if self.position == "FLAT" and action == "SHORT" and not self.allow_shorts:
             self.evidence.write("short_entry_blocked", {"ticker": self.ticker, "price": self.last_price, "thesis": d["thesis"], "execution_mode": self.execution_mode})
             self._record("FLAT", d["confidence"], f"SHORT BLOCKED BY OPERATOR ROE — {d['thesis']}", "SYSTEM", d["invalidation"])
             return
-        if self.execution_mode == "LIVE":
+        entered = False
+        if self._broker_execution_enabled():
             try:
                 action = self._route_live_action(action, d["thesis"])
+                if action in {"LONG","SHORT"} and self.position == action:
+                    entered = True
             except Exception as ex:
                 self.last_broker_error = str(ex)
-                self._record("HOLD" if self.position!="FLAT" else "FLAT",0,f"LIVE ACTION BLOCKED/FAILED: {ex}","SYSTEM")
+                self._record("HOLD" if self.position!="FLAT" else "FLAT",0,f"{self.execution_mode} ACTION BLOCKED/FAILED: {ex}","SYSTEM")
                 return
             if action == "EXIT":
-                self._record("EXIT",d["confidence"],d["thesis"],"OPENAI",d["invalidation"]); return
+                self._record("EXIT",d["confidence"],d["thesis"],"OPENAI",d["invalidation"])
+                self._refresh_daily_realized_pnl()
+                return
         else:
             position_before = self.position
-            entered = False
             if self.position=="FLAT" and action=="LONG":
                 self.position="LONG"; self.qty=self.trade_size/self.last_price; self.entry_price=self.last_price; entered = True
             elif self.position=="FLAT" and action=="SHORT":
@@ -2072,7 +2692,7 @@ class MarketHoundEngine:
             elif self.position!="FLAT" and action=="EXIT":
                 self._flatten(d["thesis"] or "AI ordered exit.","OPENAI"); return
         if self.position=="FLAT" and action=="HOLD": action="FLAT"
-        elif self.position!="FLAT" and action in {"LONG","SHORT","FLAT"} and not (self.execution_mode == "PAPER" and entered): action="HOLD"
+        elif self.position!="FLAT" and action in {"LONG","SHORT","FLAT"} and not entered: action="HOLD"
         self._record(action,d["confidence"],d["thesis"],"OPENAI",d["invalidation"])
 
     @staticmethod
@@ -2130,7 +2750,7 @@ class MarketHoundEngine:
                 "qty": round(self.qty, 4),
                 "position_value": round(
                     abs(float((self.broker_position or {}).get("market_value", 0) or 0))
-                    if self.execution_mode == "LIVE" and self.broker_position
+                    if self._broker_execution_enabled() and self.broker_position
                     else abs(self.qty * self.last_price),
                     2
                 ),
@@ -2149,8 +2769,8 @@ class MarketHoundEngine:
                 "daily_total_pnl": round(self.daily_realized_pnl + self.unrealized_pnl, 2),
                 "daily_pnl_date_et": self._pnl_date_et.isoformat(),
                 "starting_equity": round(self.starting_equity, 2),
-                "equity": round(float((self.broker_account or {}).get("equity",0) or 0),2) if self.execution_mode=="LIVE" else round(self.starting_equity + self.realized_pnl + self.unrealized_pnl, 2),
-                "buying_power": round(float((self.broker_account or {}).get("buying_power",0) or 0),2) if self.execution_mode=="LIVE" else round(self.starting_equity + self.realized_pnl - (self.trade_size if self.position != "FLAT" else 0.0), 2),
+                "equity": round(float((self.broker_account or {}).get("equity",0) or 0),2) if self._broker_execution_enabled() else round(self.starting_equity + self.realized_pnl + self.unrealized_pnl, 2),
+                "buying_power": round(float((self.broker_account or {}).get("buying_power",0) or 0),2) if self._broker_execution_enabled() else round(self.starting_equity + self.realized_pnl - (self.trade_size if self.position != "FLAT" else 0.0), 2),
                 "market_latency_ms": round(self.alpaca.last_latency_ms, 1) if self.live_mode else 0.0,
                 "trade_size": self.trade_size,
                 "profit_target": self.profit_target,
@@ -2173,10 +2793,10 @@ class MarketHoundEngine:
                     "response_id": self.last_ai_meta.get("response_id", ""),
                     "latency_ms": self.last_ai_meta.get("latency_ms", 0),
                 },
-                "credentials": {"alpaca": self.alpaca.ready, "openai": self.ai.ready, "alpaca_live": self.broker.ready},
+                "credentials": {"alpaca": self.alpaca.ready, "openai": self.ai.ready, "alpaca_paper": self.paper_broker.ready, "alpaca_live": self.broker.ready},
                 "live_execution_available": self.live_execution_available,
-                "broker_account": self._broker_account_public() if self.execution_mode=="LIVE" else {},
-                "broker_position": self._broker_position_public() if self.execution_mode=="LIVE" else {},
+                "broker_account": self._broker_account_public() if self._broker_execution_enabled() else {},
+                "broker_position": self._broker_position_public() if self._broker_execution_enabled() else {},
                 "broker_error": self.last_broker_error,
                 "debug_capture": self.debug_capture,
                 "evidence": self.evidence.status(),

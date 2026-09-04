@@ -30,4 +30,4 @@ source .venv/bin/activate
 python -m pip install -r requirements.txt
 
 echo
-printf 'MarketHound 1.2 overlay complete. Restart with:\n  cd %s && source .venv/bin/activate && python run.py\n' "$DEST"
+printf 'MarketHound 1.2-hf52 overlay complete. Restart with:\n  cd %s && source .venv/bin/activate && python run.py\n' "$DEST"

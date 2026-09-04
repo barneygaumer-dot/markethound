@@ -10,7 +10,7 @@ from .engine import MarketHoundEngine
 from .updater import AppUpdater, UpdateError
 
 APP_ROOT = Path(__file__).resolve().parents[1]
-VERSION = "1.2-hf44"
+VERSION = "1.2-hf52"
 config_store = AppConfig()
 engine = MarketHoundEngine(config_store.values)
 updater = AppUpdater(APP_ROOT)
@@ -145,7 +145,7 @@ def create_app():
             "version": VERSION,
             "app_root": str(APP_ROOT),
             "running": engine.running,
-            "credentials": {"alpaca": engine.alpaca.ready, "openai": engine.ai.ready, "alpaca_live": engine.broker.ready},
+            "credentials": {"alpaca": engine.alpaca.ready, "openai": engine.ai.ready, "alpaca_paper": engine.paper_broker.ready, "alpaca_live": engine.broker.ready},
         })
         return jsonify(v)
 

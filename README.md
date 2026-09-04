@@ -138,13 +138,17 @@ API credentials remain backend-side and should never be committed to source cont
 
 ### PAPER
 
-MarketHound maintains an internal paper position ledger and derives share quantity from the configured dollar exposure:
+PAPER execution is broker-backed through the **Alpaca Paper Trading API**. The standard Alpaca API key/secret configured in Setup/Admin are used for both market data and the paper brokerage endpoint.
+
+MarketHound derives requested share quantity from configured dollar exposure:
 
 ```text
-shares = trade_size_usd / entry_price
+shares = trade_size_usd / current_market_price
 ```
 
-PAPER is the intended mode for current live-market validation.
+Orders are submitted to Alpaca Paper, positions are reconciled from Alpaca, and cockpit equity/buying power are broker-authoritative. Broker-reported average entry prices and order fill prices are used for trade evidence and realized P&L instead of an internal pretend fill.
+
+PAPER remains the intended mode for current validation. It uses no real money, but it now exercises the same broker-order plumbing used by LIVE execution.
 
 ### LIVE
 
@@ -606,3 +610,126 @@ Under-the-hood intelligence update; **hf38 cockpit/UI geometry is unchanged and 
 - Adds `DISCLAIMER.md` covering trading risk, experimental/AI behavior, live execution, user responsibility, no warranty, and limitation of liability.
 - Commercial-license terms are separately negotiated.
 - No trading-engine, AI strategy, sizing, ROE, broker-routing, market-data, or cockpit-layout changes.
+
+
+### v1.2-hf45 — Alpaca Paper Broker Execution
+
+- Replaces the internal PAPER position simulator with real Alpaca Paper Trading API order submission.
+- PAPER LONG/SHORT/EXIT and human entries now create actual orders in the configured Alpaca paper account.
+- PAPER positions, average entry price, equity, buying power, cash, and portfolio value are reconciled from Alpaca.
+- PAPER and LIVE share the broker-routing/reconciliation path while retaining separate endpoints and credentials; LIVE remains separately gated and disabled by default.
+- Broker fill prices are captured for completed-trade evidence and session realized P&L.
+- STOP / FLATTEN closes the Alpaca broker position and verifies the resulting flat state before reporting success.
+- Broker execution remains regular-hours only. Overnight arming/observation is supported; orders remain blocked until `MARKET OPEN`.
+- No Luna strategy, sizing doctrine, Profit Target/Loss Limit semantics, market-data logic, or cockpit geometry changes.
+
+### v1.2-hf47 — Luna Institutional Memory
+
+- Adds durable local institutional memory under `data/memory/` (excluded from Git and preserved across upgrades).
+- Seeds the memory store with established WolfPack doctrine: reference levels are context, contested VWAP reduces directional authority, shorts require bearish structure, and MFE/giveback are evidence rather than mechanical exits.
+- Injects up to eight relevant promoted lessons into every Luna tactical decision as `institutional_memory`.
+- After each completed trade, Luna performs a post-trade AAR and proposes at most one reusable candidate lesson.
+- Candidate lessons are stored locally in `data/memory/candidates.jsonl`; Luna cannot directly promote a one-off observation into doctrine.
+- Automatic promotion requires at least three corroborating AAR candidates with average confidence >=75. Promoted lessons are stored in `data/memory/lessons.jsonl` and become available to future sorties.
+- Memory/AAR failures are evidence-logged and fail open: they can never block exits, broker reconciliation, STOP/FLATTEN, or trading execution.
+- No cockpit geometry, broker-routing, sizing, Profit Target/Loss Limit, or hf39 price-structure doctrine changes.
+
+- Human-entered positions now establish **HUMAN OVERRIDE** authority: Luna continues periodic analysis/thesis logging, but every AI order/EXIT is deterministically suppressed until the human position is flattened.
+- Alpaca broker failures now preserve the sanitized order payload and Alpaca response body/request ID in evidence for actionable 4xx diagnostics.
+- Alpaca SHORT entries use whole-share quantities because Alpaca does not support opening short positions with fractional sell orders; LONG entries remain fractional-capable.
+
+#### hf46 ARM-Time Ticker Intelligence Addendum
+- On ARM, Luna performs a best-effort 48-hour ticker-specific Alpaca News scan before normal tactical decisions.
+- Luna curates at most three material stories, posts one `INTEL` brief in the existing AI Decision Log, and includes compact clickable source links when available.
+- The resulting catalyst context remains in subsequent AI decision state; news is context, never an automatic LONG/SHORT signal.
+- Intel failure never blocks ARM; MarketHound logs the failure and proceeds using price/volume evidence.
+- Broker AI-entry bookkeeping now marks broker-confirmed LONG/SHORT entries correctly, eliminating the post-fill `entered` local-variable error and opening the trade ledger with AI provenance.
+- SHORT sizing remains whole-share rounded down; insufficient exposure for one whole share is blocked rather than exceeding operator-authorized dollar exposure.
+
+## v1.2-hf47 — ARM Intel Comms Fix
+- Promotes ARM-time ticker intelligence into its own revision after hf46 field testing showed no visible INTEL call in the cockpit.
+- ARM now posts an immediate `INTEL` scan-started call to the AI Decision Log, performs the 48-hour ticker scan synchronously, then posts the completed Luna catalyst brief (or an explicit unavailable/no-news result) before normal tactical thesis traffic.
+- Curated source links remain capped at three and open in a new tab; news remains context, never an automatic trade signal.
+- Removes an accidental duplicate news helper from the trading client; ticker news remains a read-only Market Data responsibility.
+- Retains hf46 institutional memory, HUMAN OVERRIDE authority, whole-share SHORT sizing, broker rejection telemetry, and broker-confirmed AI entry bookkeeping.
+
+
+## v1.2-hf48 — Broker Telemetry Repair + Directional Velocity / Move Phase
+
+- Fixes the hf47 field failure where PAPER/LIVE broker synchronization called `drain_request_events()` on `AlpacaTradingClient` but the method was missing.
+- Adds the sanitized request-event drain interface directly to the trading client, symmetric with the Market Data client.
+- Prevents diagnostic/evidence telemetry from aborting the live PAPER data/AI loop.
+- Retains ARM-time ticker intel, curated Decision Log news links, institutional memory, Human Override authority, broker-authoritative PAPER execution, whole-share SHORT sizing, and broker rejection telemetry.
+- hf47 is superseded by hf48.
+
+### Directional Velocity / Move Phase
+
+- Adds deterministic same-session 1/3/5/10-minute signed price velocity.
+- Adds directional efficiency, impulse-vs-pullback speed ratio, acceleration, and participation context.
+- Classifies the current move as `EXPANDING`, `MATURING`, `ROTATION`, or `RE_EXPANDING`.
+- Luna may recognize a fresh expanding impulse before a VWAP retest when price structure, participation, and context align.
+- Move phase is advisory AI context only; it does not bypass operator ROE, broker controls, session limits, or Human Override.
+- The engine intentionally does not add ADX/MACD/ROC to the cockpit. Raw price/volume behavior is measured first.
+
+
+## v1.2-hf49 — Luna Terrain Toolkit
+
+- Promotes the directional-velocity / move-phase work into the proper hf49 lineage.
+- Adds deterministic hidden `terrain_context` for Luna: prior-day H/L/C, premarket and session extremes, confirmed five-bar swing pivots, round-number proximity, and objectively anchored 38.2/50/61.8 Fibonacci retracement terrain.
+- Fibonacci anchors use the ordered dominant high/low extrema from the recent same-session window; they are not hand-picked and are advisory only.
+- Adds nearby-level and multi-source confluence telemetry without adding chart overlays or changing cockpit geometry.
+- Luna is instructed that levels are terrain, reaction is evidence: support/resistance/Fib/round numbers never trigger an order by themselves.
+- Luna may cite only materially relevant terrain and observed systematic behavior in Decision Log thesis/invalidation text; it must not claim to identify a specific outside algorithm from ordinary tape data.
+- No broker-routing, sizing, Profit Target/Loss Limit, Human Override, STOP/FLATTEN, or execution-authority changes.
+
+## v1.2-hf50 — Entry Location Discipline
+
+- Adds hidden `entry_location_context` for Luna using the existing hf49 terrain and move-phase telemetry; no new chart overlays.
+- Makes support/resistance entry burden explicit: near support, a new SHORT must demonstrate support failure; near resistance, a new LONG must demonstrate breakout/acceptance.
+- If support is touched without bearish failure evidence, Luna should treat a bounce as the working hypothesis and prefer FLAT until reaction confirms a trade. The resistance rule is mirrored.
+- A support touch does not automatically authorize LONG and a resistance touch does not automatically authorize SHORT; reaction, structure, velocity, and participation still provide confirmation.
+- Encourages ambush/retest entries over chasing a mature move into opposing terrain. Directional bias and entry quality are deliberately separated.
+- Advisory AI guidance only. Broker routing, sizing, Profit Target/Loss Limit, Human Override, STOP/FLATTEN, and execution authority are unchanged.
+
+
+### v1.2-hf51 — Equilibrium / Terra Firma doctrine
+- Adds hidden `equilibrium_context` for Luna.
+- Without an active catalyst, VWAP receives high session-equilibrium weight and SMA5 high strategic-reference weight.
+- A catalyst reduces that weight only when the tape confirms sustained repricing through velocity, participation, efficiency, and structure.
+- As catalyst pressure matures/rotates, VWAP/SMA5 reference weight rises again.
+- Reference gravity is advisory context for entry selection, never an automatic mean-reversion trigger and never a deterministic ROE override.
+
+### v1.2-hf52 — Luna Tactical Discretion / Tools, Not Handcuffs
+- Reframes Luna's tactical prompt around commander's intent: hunt for positive expectancy and positive realized P&L while preserving capital.
+- Preserves the full hf51 sensor/evidence suite (VWAP/SMA5 equilibrium, catalyst context, velocity/phase, terrain, entry location, momentum health, institutional memory) but explicitly treats them as tools/evidence rather than deterministic tactical rules.
+- Luna now decides which evidence deserves weight in the current regime and is judged on favorable asymmetry, entry location, local edge persistence, and disciplined FLAT decisions rather than rule compliance or directional correctness.
+- Deterministic ROE remains unchanged: broker truth/routing, dollar exposure and sizing, session profit/loss limits, STOP/FLATTEN, market-hours restrictions, Human Override, allowed-short authority, and evidence capture remain hard rails.
+- Decision Log guidance emphasizes concise explanation of only the evidence that materially drove the decision.
+
+## hf52 Frozen Evaluation Baseline — 2026-09-04
+
+MarketHound v1.2-hf52 is the frozen evaluation baseline through 2026-09-12.
+
+### Tactical doctrine
+
+- **Cash is a position.** Unallocated buying power creates no obligation to trade.
+- **No compulsive trading.** Trade activity is not a measure of performance.
+- **The Profit Target is a stopping condition, not a trading quota.**
+- A losing trade or losing session creates no obligation to immediately recover the loss.
+- Every new trade must independently earn its right to exist through favorable price, structure, location, participation, technical evidence, risk/reward, and expected value.
+- `FLAT` is an intentional tactical decision and may be the highest-quality decision available.
+- Luna receives tools, not handcuffs. VWAP, SMA5, catalyst context, velocity, move phase, terrain, support/resistance, Fibonacci/confluence, momentum health, and institutional memory are evidence to be weighted contextually rather than automatic trade commands.
+- Directional bias does not equal current opportunity. Correct direction at poor location remains a poor trade.
+- Capital preservation and favorable asymmetry take precedence over trade frequency.
+- Premarket and after-hours activity provide reconnaissance and context. Broker execution remains restricted to the regular session.
+- Premarket evidence may establish hypotheses for the regular session, but the opening print is price discovery rather than automatic directional confirmation. Sustained tape behavior after the open determines whether control has actually emerged.
+
+### Evaluation protocol
+
+During the freeze, hf52 will be evaluated across multiple independent market sessions without tactical code changes.
+
+Daily evidence and debug records will be retained for AAR analysis. Candidate improvements may be discussed and documented, but executable MarketHound changes remain under stand-down through 2026-09-12.
+
+The purpose of the freeze is to distinguish repeatable behavior from single-session anecdotes before modifying the strategy.
+
+**Semper Discipline. Semper Evidence Before Wrenches.**
